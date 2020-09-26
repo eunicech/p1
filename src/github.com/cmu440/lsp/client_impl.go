@@ -6,6 +6,8 @@ import "errors"
 
 type client struct {
 	// TODO: implement this!
+	epoch      int
+	epochLimit int
 }
 
 // NewClient creates, initiates, and returns a new client. This function
