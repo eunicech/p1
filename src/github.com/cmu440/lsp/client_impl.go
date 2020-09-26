@@ -2,12 +2,24 @@
 
 package lsp
 
-import "errors"
+import (
+	"encoding/json"
+	"errors"
+	"time"
+
+	"github.com/cmu440/lspnet"
+)
 
 type client struct {
-	// TODO: implement this!
-	epoch      int
-	epochLimit int
+	//epoch          int
+	epochLimit     int
+	windowSize     int
+	maxUnackedMsgs int
+	backOff        int
+	maxBackOff     int
+	timer          *time.Ticker
+	clientID       int
+	conn           *lspnet.UDPConn
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -21,11 +33,48 @@ type client struct {
 // hostport is a colon-separated string identifying the server's host address
 // and port number (i.e., "localhost:9999").
 func NewClient(hostport string, params *Params) (Client, error) {
-	return nil, errors.New("not yet implemented")
+	udpAddr, err := lspnet.ResolveUDPAddr("udp", hostport)
+	if err != nil {
+		return nil, err
+	}
+	udp, err := lspnet.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	//send connection
+	msg, err := json.Marshal(NewConnect())
+	if err != nil {
+		return nil, err
+	}
+	udp.Write(msg)
+
+	// wait for acknowledgement
+	var ack []byte
+	bytesRead, err := udp.Read(ack)
+	if err != nil {
+		return nil, err
+	}
+	var ack_msg Message
+	json.Unmarshal(ack[:bytesRead], &ack_msg)
+	if ack_msg.Type != MsgAck || ack_msg.SeqNum != 0 {
+		return nil, errors.New("Not an acknowledgement to connection")
+	}
+
+	return &client{
+		clientID:       ack_msg.ConnID,
+		conn:           udp,
+		epochLimit:     params.EpochLimit,
+		windowSize:     params.WindowSize,
+		maxBackOff:     params.MaxBackOffInterval,
+		maxUnackedMsgs: params.MaxUnackedMessages,
+		timer:          time.NewTicker(time.Duration(1000000 * params.EpochMillis)),
+	}, nil
+
 }
 
 func (c *client) ConnID() int {
-	return -1
+	return c.clientID
 }
 
 func (c *client) Read() ([]byte, error) {
