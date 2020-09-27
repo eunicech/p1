@@ -24,7 +24,15 @@ type client struct {
 	serverSN      int      //keeps track of packets recieved
 	server_sn_res chan int // get what packet # we are waiting for
 	get_server_sn chan int
+	client_sn_res chan int // get what packet # we are writing
+	get_client_sn chan int
 	pendingMsgs   *list.List
+	acks          chan Message
+}
+
+type readReq struct {
+	dataSN  int
+	dataRes chan Message
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -78,8 +86,10 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		server_sn_res: make(chan int),
 		get_server_sn: make(chan int),
 		pendingMsgs:   list.New(),
+		acks:          make(chan Message),
 	}
 	go new_client.clientInfoRequests()
+	go new_client.writeRoutine()
 	return new_client, nil
 }
 
@@ -94,12 +104,36 @@ func (c *client) clientInfoRequests() {
 				//this is request to add to serverSN
 				c.serverSN += add
 			}
+		case add := <-c.get_client_sn:
+			if add < 0 {
+				//this is a request to get the currSN
+				c.client_sn_res <- c.currSN
+			} else {
+				//this is request to add to currSN
+				c.currSN += add
+			}
 		}
 	}
 }
 
 func (c *client) ConnID() int {
 	return c.clientID
+}
+
+func (c *client) readRoutine() {
+	//read message from server
+}
+
+func (c *client) writeRoutine() {
+	for {
+		msg := c.pendingMsgs.Front()
+		if msg == nil {
+			continue
+		}
+		c.conn.Write(msg)
+		//wait for acknowledgement
+		ackMsg := <-c.acks
+	}
 }
 
 func (c *client) Read() ([]byte, error) {
@@ -127,7 +161,12 @@ func (c *client) Read() ([]byte, error) {
 }
 
 func (c *client) Write(payload []byte) error {
-	return errors.New("not yet implemented")
+	c.get_client_sn <- -1
+	sn := <-c.client_sn_res
+	checksum := ByteArray2Checksum(payload)
+	dataMsg := NewData(c.ConnID, sn, len(payload), payload, checksum)
+	c.pendingMsgs.PushBack(dataMsg)
+	c.get_client_sn <- 1
 }
 
 func (c *client) Close() error {
