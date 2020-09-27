@@ -28,7 +28,18 @@ type client struct {
 	get_client_sn chan int
 	pendingMsgs   *list.List
 	acks          chan Message
+	dataStorage   data
 }
+
+type data struct {
+	read_reqs   chan readReq
+	pendingData map[int]Message
+	addData     chan Message
+}
+
+//map
+//put into map
+//take out of map -> read req
 
 type readReq struct {
 	dataSN  int
@@ -73,6 +84,11 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	if ack_msg.Type != MsgAck || ack_msg.SeqNum != 0 {
 		return nil, errors.New("Not an acknowledgement to connection")
 	}
+	dataStore := data{
+		read_reqs:   make(chan readReq),
+		pendingData: make(map[int]Message),
+		addData:     make(chan Message),
+	}
 	new_client := &client{
 		//epochLimit:     params.EpochLimit,
 		//windowSize:     params.WindowSize,
@@ -87,9 +103,11 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		get_server_sn: make(chan int),
 		pendingMsgs:   list.New(),
 		acks:          make(chan Message),
+		dataStorage:   dataStore,
 	}
 	go new_client.clientInfoRequests()
 	go new_client.writeRoutine()
+	go new_client.readRoutine()
 	return new_client, nil
 }
 
@@ -120,8 +138,51 @@ func (c *client) ConnID() int {
 	return c.clientID
 }
 
+func (c *client) readRequestsRoutine() {
+	var curr_req int
+	var curr_chan chan Message
+	for {
+		select {
+		case req := <-c.dataStorage.read_reqs:
+			//assumes another read request from client can't come until this one is fulfilled
+			curr_req = req.dataSN
+			curr_chan = req.dataRes
+		case packet := <-c.dataStorage.addData:
+			c.dataStorage.pendingData[packet.SeqNum] = packet
+		}
+		value, exists := c.dataStorage.pendingData[curr_req]
+		if exists {
+			//remove the value
+			delete(c.dataStorage.pendingData, curr_req)
+			//send acknowledgement
+			ack, _ := json.Marshal(NewAck(c.clientID, curr_req))
+			c.conn.Write(ack)
+			//add value to channel
+			curr_chan <- value
+		}
+	}
+}
+
 func (c *client) readRoutine() {
-	//read message from server
+	go c.readRequestsRoutine()
+	for {
+		//read message from server
+		var packet []byte
+		bytesRead, _ := c.conn.Read(packet)
+		var data Message
+		json.Unmarshal(packet[:bytesRead], &data)
+
+		//check if this an acknowledgement
+		if data.Type == MsgAck {
+			c.acks <- data
+		}
+
+		//TODO: check if it is a heartbeat message
+
+		//data message
+		c.dataStorage.addData(Message)
+	}
+
 }
 
 func (c *client) writeRoutine() {
@@ -130,30 +191,26 @@ func (c *client) writeRoutine() {
 		if msg == nil {
 			continue
 		}
-		c.conn.Write(msg)
+		byte_msg, _ := json.Marshal(msg.Value)
+		c.conn.Write(byte_msg)
 		//wait for acknowledgement
-		ackMsg := <-c.acks
+		<-c.acks
 	}
 }
 
 func (c *client) Read() ([]byte, error) {
 	//get number of data packet you need to read
 	c.get_server_sn <- -1
-	// sn := <-c.server_sn_res
-	<-c.server_sn_res
-
-	//TODO: implement order with linked list and checking sn
-
-	//read message from server
-	var packet []byte
-	bytesRead, _ := c.conn.Read(packet)
-	var data Message
-	json.Unmarshal(packet[:bytesRead], &data)
-
-	//send acknowledgement
-	ack := json.Marshal(NewAck(c.ConnID, data.SeqNum))
-	c.conn.Write(ack)
-
+	sn := <-c.server_sn_res
+	result := make(chan Message)
+	//create read request
+	request := readReq{
+		dataSN:  sn,
+		dataRes: result,
+	}
+	c.dataStorage.read_reqs <- request
+	//wait for data
+	data := <-request.dataRes
 	//increase server_sn
 	c.get_server_sn <- 1
 
@@ -163,10 +220,11 @@ func (c *client) Read() ([]byte, error) {
 func (c *client) Write(payload []byte) error {
 	c.get_client_sn <- -1
 	sn := <-c.client_sn_res
-	checksum := ByteArray2Checksum(payload)
-	dataMsg := NewData(c.ConnID, sn, len(payload), payload, checksum)
+	checksum := uint16(ByteArray2Checksum(payload))
+	dataMsg := NewData(c.clientID, sn, len(payload), payload, checksum)
 	c.pendingMsgs.PushBack(dataMsg)
 	c.get_client_sn <- 1
+	return nil
 }
 
 func (c *client) Close() error {
