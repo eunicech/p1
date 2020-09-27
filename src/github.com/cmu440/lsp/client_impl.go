@@ -180,7 +180,7 @@ func (c *client) readRoutine() {
 		//TODO: check if it is a heartbeat message
 
 		//data message
-		c.dataStorage.addData(Message)
+		c.dataStorage.addData <- data
 	}
 
 }
