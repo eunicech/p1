@@ -29,12 +29,15 @@ type client struct {
 	pendingMsgs   *list.List
 	acks          chan Message
 	dataStorage   data
+	closeActivate chan bool
+	closed        bool
 }
 
 type data struct {
 	read_reqs   chan readReq
 	pendingData map[int]Message
 	addData     chan Message
+	closed      chan bool
 }
 
 //map
@@ -88,6 +91,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		read_reqs:   make(chan readReq),
 		pendingData: make(map[int]Message),
 		addData:     make(chan Message),
+		closed:      make(chan bool),
 	}
 	new_client := &client{
 		//epochLimit:     params.EpochLimit,
@@ -104,6 +108,8 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		pendingMsgs:   list.New(),
 		acks:          make(chan Message),
 		dataStorage:   dataStore,
+		closeActivate: make(chan bool),
+		closed:        false,
 	}
 	go new_client.clientInfoRequests()
 	go new_client.writeRoutine()
@@ -130,6 +136,9 @@ func (c *client) clientInfoRequests() {
 				//this is request to add to currSN
 				c.currSN += add
 			}
+		case <-c.closeActivate:
+			c.closed = true
+			break
 		}
 	}
 }
@@ -149,6 +158,9 @@ func (c *client) readRequestsRoutine() {
 			curr_chan = req.dataRes
 		case packet := <-c.dataStorage.addData:
 			c.dataStorage.pendingData[packet.SeqNum] = packet
+		case <-c.dataStorage.closed:
+			break
+
 		}
 		value, exists := c.dataStorage.pendingData[curr_req]
 		if exists {
@@ -166,35 +178,54 @@ func (c *client) readRequestsRoutine() {
 func (c *client) readRoutine() {
 	go c.readRequestsRoutine()
 	for {
-		//read message from server
-		var packet []byte
-		bytesRead, _ := c.conn.Read(packet)
-		var data Message
-		json.Unmarshal(packet[:bytesRead], &data)
+		select {
+		case <-c.dataStorage.closed:
+			break
+		default:
+			//read message from server
+			var packet []byte
+			bytesRead, _ := c.conn.Read(packet)
+			var data Message
+			json.Unmarshal(packet[:bytesRead], &data)
 
-		//check if this an acknowledgement
-		if data.Type == MsgAck {
-			c.acks <- data
+			//check if this an acknowledgement
+			if data.Type == MsgAck {
+				c.acks <- data
+			}
+			//TODO: check if it is a heartbeat message
+
+			//data message
+			c.dataStorage.addData <- data
+
 		}
-
-		//TODO: check if it is a heartbeat message
-
-		//data message
-		c.dataStorage.addData <- data
 	}
 
 }
 
 func (c *client) writeRoutine() {
+	var needToClose bool = false
 	for {
-		msg := c.pendingMsgs.Front()
-		if msg == nil {
-			continue
+		select {
+		case <-c.closeActivate:
+			needToClose = true
+		default:
+			msg := c.pendingMsgs.Front()
+			if msg == nil {
+				if needToClose {
+					c.conn.Close()
+					//signal to stop reading
+					close(c.dataStorage.closed)
+					break
+				} else {
+					continue
+				}
+			}
+			byte_msg, _ := json.Marshal(msg.Value)
+			c.conn.Write(byte_msg)
+			//wait for acknowledgement
+			<-c.acks
 		}
-		byte_msg, _ := json.Marshal(msg.Value)
-		c.conn.Write(byte_msg)
-		//wait for acknowledgement
-		<-c.acks
+
 	}
 }
 
@@ -228,5 +259,10 @@ func (c *client) Write(payload []byte) error {
 }
 
 func (c *client) Close() error {
-	return errors.New("not yet implemented")
+	//check if client was already closed
+	if c.closed {
+		return errors.New("Client already closed")
+	}
+	close(c.closeActivate)
+	return nil
 }
