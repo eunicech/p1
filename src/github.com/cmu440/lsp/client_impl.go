@@ -19,19 +19,20 @@ type client struct {
 	//backOff          int
 	//maxBackOff       int
 	//timer            *time.Ticker
-	clientID      int
-	conn          *lspnet.UDPConn
-	currSN        int      //keeps track of sequence numbers
-	serverSN      int      //keeps track of packets recieved
-	server_sn_res chan int // get what packet # we are waiting for
-	get_server_sn chan int
-	client_sn_res chan int // get what packet # we are writing
-	get_client_sn chan int
-	pendingMsgs   *list.List
-	acks          chan Message
-	dataStorage   data
-	closeActivate chan bool
-	closed        bool
+	clientID       int
+	conn           *lspnet.UDPConn
+	currSN         int      //keeps track of sequence numbers
+	serverSN       int      //keeps track of packets recieved
+	server_sn_res  chan int // get what packet # we are waiting for
+	get_server_sn  chan int
+	client_sn_res  chan int // get what packet # we are writing
+	get_client_sn  chan int
+	pendingMsgs    *list.List
+	pendingMsgChan chan Message
+	acks           chan Message
+	dataStorage    data
+	closeActivate  chan bool
+	closed         bool
 }
 
 type data struct {
@@ -75,26 +76,31 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	udp.Write(msg)
+
+	fmt.Println("going to write")
+	udp.WriteToUDP(msg, udpAddr)
+	fmt.Println("finished write")
 
 	// wait for acknowledgement
 	var ack_msg Message
 	for {
 		var ack []byte = make([]byte, 0, 2000)
 		var temp Message
-		bytesRead, err := udp.Read(ack)
+		fmt.Println("going to read")
+		bytesRead, _, err := udp.ReadFromUDP(ack)
+		fmt.Println("finished read")
 		if err != nil {
 			return nil, err
 		}
 		json.Unmarshal(ack[:bytesRead], &temp)
 		fmt.Println(temp)
-		if ack_msg.Type == MsgAck || ack_msg.SeqNum == 0 {
-			fmt.Printf("if %+v\n", ack_msg)
+		if ack_msg.Type == MsgAck && ack_msg.SeqNum == 0 {
+			//fmt.Printf("if %+v\n", temp)
 			ack_msg = temp
 			break
 		}
 	}
-	fmt.Println("out of for loop")
+	fmt.Println(ack_msg)
 	dataStore := data{
 		read_reqs:   make(chan readReq),
 		pendingData: make(map[int]Message),
@@ -107,17 +113,18 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		//maxBackOff:     params.MaxBackOffInterval,
 		//maxUnackedMsgs: params.MaxUnackedMessages,
 		//timer:          time.NewTicker(time.Duration(1000000 * params.EpochMillis)),
-		clientID:      ack_msg.ConnID,
-		conn:          udp,
-		currSN:        1,
-		serverSN:      1,
-		server_sn_res: make(chan int),
-		get_server_sn: make(chan int),
-		pendingMsgs:   list.New(),
-		acks:          make(chan Message),
-		dataStorage:   dataStore,
-		closeActivate: make(chan bool),
-		closed:        false,
+		clientID:       ack_msg.ConnID,
+		conn:           udp,
+		currSN:         1,
+		serverSN:       1,
+		server_sn_res:  make(chan int),
+		get_server_sn:  make(chan int),
+		pendingMsgs:    list.New(),
+		pendingMsgChan: make(chan Message),
+		acks:           make(chan Message),
+		dataStorage:    dataStore,
+		closeActivate:  make(chan bool),
+		closed:         false,
 	}
 	go new_client.clientInfoRequests()
 	go new_client.writeRoutine()
@@ -174,9 +181,7 @@ func (c *client) readRequestsRoutine() {
 		if exists {
 			//remove the value
 			delete(c.dataStorage.pendingData, curr_req)
-			//send acknowledgement
-			ack, _ := json.Marshal(NewAck(c.clientID, curr_req))
-			c.conn.Write(ack)
+
 			//add value to channel
 			curr_chan <- value
 		}
@@ -191,10 +196,10 @@ func (c *client) readRoutine() {
 			break
 		default:
 			//read message from server
-			var packet []byte
+			var packet []byte = make([]byte, 0, 2000)
 			bytesRead, _ := c.conn.Read(packet)
 			var data Message
-			json.Unmarshal(packet[:bytesRead], &data)
+			json.Unmarshal(packet[:bytesRead], data)
 
 			//check if this an acknowledgement
 			if data.Type == MsgAck {
@@ -203,6 +208,8 @@ func (c *client) readRoutine() {
 			//TODO: check if it is a heartbeat message
 
 			//data message
+			ack, _ := json.Marshal(NewAck(c.clientID, data.SeqNum))
+			c.conn.Write(ack)
 			c.dataStorage.addData <- data
 
 		}
@@ -216,6 +223,8 @@ func (c *client) writeRoutine() {
 		select {
 		case <-c.closeActivate:
 			needToClose = true
+		case dataMsg := <-c.pendingMsgChan:
+			c.pendingMsgs.PushBack(dataMsg)
 		default:
 			msg := c.pendingMsgs.Front()
 			if msg == nil {
@@ -261,7 +270,7 @@ func (c *client) Write(payload []byte) error {
 	sn := <-c.client_sn_res
 	checksum := uint16(ByteArray2Checksum(payload))
 	dataMsg := NewData(c.clientID, sn, len(payload), payload, checksum)
-	c.pendingMsgs.PushBack(dataMsg)
+	c.pendingMsgChan <- *dataMsg
 	c.get_client_sn <- 1
 	return nil
 }
