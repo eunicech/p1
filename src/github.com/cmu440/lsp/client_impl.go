@@ -6,6 +6,7 @@ import (
 	"container/list"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/cmu440/lspnet"
 )
@@ -77,16 +78,23 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	udp.Write(msg)
 
 	// wait for acknowledgement
-	var ack []byte
-	bytesRead, err := udp.Read(ack)
-	if err != nil {
-		return nil, err
-	}
 	var ack_msg Message
-	json.Unmarshal(ack[:bytesRead], &ack_msg)
-	if ack_msg.Type != MsgAck || ack_msg.SeqNum != 0 {
-		return nil, errors.New("Not an acknowledgement to connection")
+	for {
+		var ack []byte = make([]byte, 0, 2000)
+		var temp Message
+		bytesRead, err := udp.Read(ack)
+		if err != nil {
+			return nil, err
+		}
+		json.Unmarshal(ack[:bytesRead], &temp)
+		fmt.Println(temp)
+		if ack_msg.Type == MsgAck || ack_msg.SeqNum == 0 {
+			fmt.Printf("if %+v\n", ack_msg)
+			ack_msg = temp
+			break
+		}
 	}
+	fmt.Println("out of for loop")
 	dataStore := data{
 		read_reqs:   make(chan readReq),
 		pendingData: make(map[int]Message),
