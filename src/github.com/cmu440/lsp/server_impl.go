@@ -2,10 +2,31 @@
 
 package lsp
 
-import "errors"
+import (
+	"encoding/json"
+	"errors"
+	"strconv"
+
+	"github.com/cmu440/lspnet"
+)
 
 type server struct {
-	// TODO: Implement this!
+	clientMap map[string]client_info
+	conn      *lspnet.UDPConn
+}
+
+type client_info struct {
+	client_id      int
+	curr_sn        int
+	client_sn      int
+	ack            chan Message
+	addr           *lspnet.UDPAddr
+	storedMessages map[int]Message
+	curr_sn_req    chan int
+	curr_sn_res    chan int
+	client_sn_req  chan int
+	client_sn_res  chan int
+	closed         chan bool
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -15,7 +36,49 @@ type server struct {
 // project 0, etc.) and immediately return. It should return a non-nil error if
 // there was an error resolving or listening on the specified port number.
 func NewServer(port int, params *Params) (Server, error) {
-	return nil, errors.New("not yet implemented")
+	hostport := ":" + strconv.Itoa(port)
+	UDPAddr, err := lspnet.ResolveUDPAddr("udp", hostport)
+	if err != nil {
+		return nil, err
+	}
+
+	//listen on port
+	udpconn, err := lspnet.ListenUDP("udp", UDPAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	new_server := &server{
+		clientMap: make(map[string]client_info),
+		conn:      udpconn,
+	}
+	go new_server.writeRoutine()
+	go new_server.readRoutine()
+	return new_server, nil
+}
+
+func (s *server) writeRoutine() {
+}
+
+func (s *server) mapRequestHandler() {
+
+}
+
+func (s *server) readRoutine() {
+	go s.mapRequestHandler()
+	for {
+		var packet []byte = make([]byte, 0, 2000)
+		bytesRead, _, _ := s.conn.ReadFromUDP(packet)
+		var data Message
+		json.Unmarshal(packet[:bytesRead], &data)
+
+		//client_addr := addr.String()
+		if data.Type == MsgAck {
+			//TODO
+		}
+
+	}
+
 }
 
 func (s *server) Read() (int, []byte, error) {
