@@ -78,28 +78,28 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	}
 
 	fmt.Println("going to write")
-	udp.WriteToUDP(msg, udpAddr)
+	udp.Write(msg)
 	fmt.Println("finished write")
 
 	// wait for acknowledgement
 	var ack_msg Message
 	for {
-		var ack []byte = make([]byte, 0, 2000)
 		var temp Message
+		var ack []byte = make([]byte, 0, 2000)
 		fmt.Println("going to read")
-		bytesRead, _, err := udp.ReadFromUDP(ack)
+		bytesRead, err := udp.Read(ack)
 		fmt.Println("finished read")
 		if err != nil {
 			return nil, err
 		}
 		json.Unmarshal(ack[:bytesRead], &temp)
-		fmt.Println(temp)
-		if ack_msg.Type == MsgAck && ack_msg.SeqNum == 0 {
-			//fmt.Printf("if %+v\n", temp)
+		fmt.Printf("if %+v\n", temp)
+		if temp.Type == MsgAck && temp.SeqNum == 0 {
 			ack_msg = temp
 			break
 		}
 	}
+
 	fmt.Println(ack_msg)
 	dataStore := data{
 		read_reqs:   make(chan readReq),
@@ -198,19 +198,19 @@ func (c *client) readRoutine() {
 			//read message from server
 			var packet []byte = make([]byte, 0, 2000)
 			bytesRead, _ := c.conn.Read(packet)
-			var data Message
+			var data *Message = new(Message)
 			json.Unmarshal(packet[:bytesRead], data)
 
 			//check if this an acknowledgement
 			if data.Type == MsgAck {
-				c.acks <- data
+				c.acks <- *data
 			}
 			//TODO: check if it is a heartbeat message
 
 			//data message
 			ack, _ := json.Marshal(NewAck(c.clientID, data.SeqNum))
 			c.conn.Write(ack)
-			c.dataStorage.addData <- data
+			c.dataStorage.addData <- *data
 
 		}
 	}
