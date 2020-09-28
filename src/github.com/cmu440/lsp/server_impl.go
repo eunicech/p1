@@ -11,8 +11,14 @@ import (
 )
 
 type server struct {
-	clientMap map[string]client_info
-	conn      *lspnet.UDPConn
+	clientMap      map[int]client_info
+	client_num     int
+	client_num_req chan int
+	conn           *lspnet.UDPConn
+	add_msg        chan Message
+	new_client     chan client_info
+	read_req       chan bool
+	read_res       chan Message
 }
 
 type client_info struct {
@@ -49,32 +55,88 @@ func NewServer(port int, params *Params) (Server, error) {
 	}
 
 	new_server := &server{
-		clientMap: make(map[string]client_info),
+		clientMap: make(map[int]client_info),
 		conn:      udpconn,
+		add_msg:   make(chan Message),
+		read_req:  make(chan bool),
+		read_res:  make(chan Message),
 	}
 	go new_server.writeRoutine()
 	go new_server.readRoutine()
 	return new_server, nil
 }
 
-func (s *server) writeRoutine() {
-}
-
 func (s *server) mapRequestHandler() {
+	for {
+		select {
+		case msg := <-s.add_msg:
+			client := s.clientMap[msg.ConnID]
+			switch msg.Type {
+			case MsgAck:
+				client.ack <- msg
+			case MsgData:
+				client.storedMessages[msg.SeqNum] = msg
+			}
+		case new_client := <-s.new_client:
+			new_client.client_id = s.client_num
+			s.client_num += s.client_num
+			//send acknowledgement to client
+			ack, _ := json.Marshal(NewAck(new_client.client_id, 0))
+			s.conn.WriteToUDP(ack, new_client.addr)
+		case <-s.read_req:
+			var cr client_info
+			var found bool = false
+			for _, v := range s.clientMap {
+				_, ok := v.storedMessages[v.client_sn]
+				if ok {
+					cr = v
+					found = true
+					break
+				}
+			}
+			if found {
+				res := cr.storedMessages[cr.client_sn]
+				delete(cr.storedMessages, cr.client_sn)
+				cr.client_sn += 1
+				s.read_res <- res
+			}
 
+		}
+	}
 }
 
 func (s *server) readRoutine() {
 	go s.mapRequestHandler()
 	for {
 		var packet []byte = make([]byte, 0, 2000)
-		bytesRead, _, _ := s.conn.ReadFromUDP(packet)
+		bytesRead, addr, _ := s.conn.ReadFromUDP(packet)
 		var data Message
 		json.Unmarshal(packet[:bytesRead], &data)
+		//check if its a connection message
+		if data.Type == MsgConnect {
+			new_client := client_info{
+				curr_sn:        1,
+				client_sn:      1,
+				ack:            make(chan Message),
+				addr:           addr,
+				storedMessages: make(map[int]Message),
+				curr_sn_req:    make(chan int),
+				curr_sn_res:    make(chan int),
+				client_sn_req:  make(chan int),
+				client_sn_res:  make(chan int),
+				closed:         make(chan bool),
+			}
+			s.new_client <- new_client
+		} else {
+			//check if data message and need to send ack
+			if data.Type == MsgData {
+				//TODO: verify checksum
+				ack, _ := json.Marshal(NewAck(data.ConnID, data.SeqNum))
+				s.conn.WriteToUDP(ack, addr)
+			}
 
-		//client_addr := addr.String()
-		if data.Type == MsgAck {
-			//TODO
+			s.add_msg <- data
+
 		}
 
 	}
@@ -82,13 +144,19 @@ func (s *server) readRoutine() {
 }
 
 func (s *server) Read() (int, []byte, error) {
-	// TODO: remove this line when you are ready to begin implementing this method.
-	select {} // Blocks indefinitely.
-	return -1, nil, errors.New("not yet implemented")
+	//create request
+	s.read_req <- true
+	//wait for result
+	msg := <-s.read_res
+	return msg.ConnID, msg.Payload, nil
+}
+
+func (s *server) writeRoutine() {
+
 }
 
 func (s *server) Write(connId int, payload []byte) error {
-	return errors.New("not yet implemented")
+
 }
 
 func (s *server) CloseConn(connId int) error {
