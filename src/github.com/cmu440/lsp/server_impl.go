@@ -12,25 +12,16 @@ import (
 )
 
 type server struct {
-	clientMap  map[int]client_info
-	client_num int
-	// client_num_req  chan int
-	conn *lspnet.UDPConn
-	// add_msg         chan Message
-	// new_client      chan client_info
-	// read_req        chan bool
+	clientMap      map[int]client_info
+	client_num     int
+	conn           *lspnet.UDPConn
 	read_res       chan Message
 	pendingMsgs    *list.List
 	pendingMsgChan chan Message
-	// client_sn_req   chan write_req
-	// client_addr_req chan addr_req
-	// addPending      chan int
-	// removePending   chan int
-	// closeConn       chan close_req
-	closed        bool
-	closeActivate chan bool
-	readingClose  chan bool
-	reqChan       chan request
+	closed         bool
+	closeActivate  chan bool
+	readingClose   chan bool
+	reqChan        chan request
 }
 
 type request struct {
@@ -55,21 +46,6 @@ const (
 	RemovePending
 	CloseCxn
 )
-
-// type close_req struct {
-// 	clientID int
-// 	res      chan bool
-// }
-
-// type addr_req struct {
-// 	clientId int
-// 	addr_res chan *lspnet.UDPAddr
-// 	ack_chan chan chan Message
-// }
-// type write_req struct {
-// 	clientID int
-// 	sn_res   chan int
-// }
 
 type client_info struct {
 	client_id      int
@@ -191,76 +167,6 @@ func (s *server) mapRequestHandler() {
 		}
 	}
 }
-
-// func (s *server) mapRequestHandler() {
-// 	for {
-// 		select {
-// 		case msg := <-s.add_msg:
-// 			client := s.clientMap[msg.ConnID]
-// 			switch msg.Type {
-// 			case MsgAck:
-// 				client.ack <- msg
-// 			case MsgData:
-// 				client.storedMessages[msg.SeqNum] = msg
-// 			}
-// 		case new_client := <-s.new_client:
-// 			new_client.client_id = s.client_num
-// 			s.client_num += 1
-// 			//send acknowledgement to client
-// 			ack, _ := json.Marshal(NewAck(new_client.client_id, 0))
-// 			s.conn.WriteToUDP(ack, new_client.addr)
-// 		case <-s.read_req:
-// 			var cr client_info
-// 			var found bool = false
-// 			for _, v := range s.clientMap {
-// 				_, ok := v.storedMessages[v.client_sn]
-// 				if ok {
-// 					cr = v
-// 					found = true
-// 					break
-// 				}
-// 			}
-// 			if found {
-// 				res := cr.storedMessages[cr.client_sn]
-// 				delete(cr.storedMessages, cr.client_sn)
-// 				cr.client_sn += 1
-// 				s.read_res <- res
-// 			}
-// 		case req := <-s.client_sn_req:
-// 			client := s.clientMap[req.clientID]
-// 			sn := client.curr_sn
-// 			client.curr_sn += 1
-// 			req.sn_res <- sn
-// 		case req := <-s.client_addr_req:
-// 			client := s.clientMap[req.clientId]
-// 			req.addr_res <- client.addr
-// 			req.ack_chan <- client.ack
-// 		case clientID := <-s.addPending:
-// 			client := s.clientMap[clientID]
-// 			client.toWrite += 1
-// 		case clientID := <-s.removePending:
-// 			client := s.clientMap[clientID]
-// 			client.toWrite -= 1
-// 			if client.toWrite == 0 && client.closeActivate {
-// 				delete(s.clientMap, clientID)
-// 			}
-// 		case req := <-s.closeConn:
-// 			client, ok := s.clientMap[req.clientID]
-// 			if !ok {
-// 				req.res <- true
-// 			} else {
-// 				client.closeActivate = true
-// 				client.toWrite -= 1
-// 				if client.toWrite == 0 && client.closeActivate {
-// 					delete(s.clientMap, req.clientID)
-// 				}
-// 				req.res <- false
-// 			}
-// 		case <-s.readingClose:
-// 			break
-// 		}
-// 	}
-// }
 
 func (s *server) readRoutine() {
 	go s.mapRequestHandler()
