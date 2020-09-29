@@ -3,6 +3,7 @@
 package lsp
 
 import (
+	"container/list"
 	"encoding/json"
 	"errors"
 	"strconv"
@@ -19,6 +20,14 @@ type server struct {
 	new_client     chan client_info
 	read_req       chan bool
 	read_res       chan Message
+	pendingMsgs    *list.List
+	pendingMsgChan chan Message
+	client_sn_req  chan write_req
+}
+
+type write_req struct {
+	clientID int
+	sn_res   chan int
 }
 
 type client_info struct {
@@ -28,11 +37,11 @@ type client_info struct {
 	ack            chan Message
 	addr           *lspnet.UDPAddr
 	storedMessages map[int]Message
-	curr_sn_req    chan int
-	curr_sn_res    chan int
-	client_sn_req  chan int
-	client_sn_res  chan int
-	closed         chan bool
+	// curr_sn_req    chan int
+	// curr_sn_res    chan int
+	// client_sn_req  chan int
+	// client_sn_res  chan int
+	closed chan bool
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -55,11 +64,13 @@ func NewServer(port int, params *Params) (Server, error) {
 	}
 
 	new_server := &server{
-		clientMap: make(map[int]client_info),
-		conn:      udpconn,
-		add_msg:   make(chan Message),
-		read_req:  make(chan bool),
-		read_res:  make(chan Message),
+		clientMap:     make(map[int]client_info),
+		conn:          udpconn,
+		add_msg:       make(chan Message),
+		read_req:      make(chan bool),
+		read_res:      make(chan Message),
+		pendingMsgs:   list.New(),
+		client_sn_req: make(chan write_req),
 	}
 	go new_server.writeRoutine()
 	go new_server.readRoutine()
@@ -100,7 +111,11 @@ func (s *server) mapRequestHandler() {
 				cr.client_sn += 1
 				s.read_res <- res
 			}
-
+		case req := <-s.client_sn_req:
+			client := s.clientMap[req.clientID]
+			sn := client.curr_sn
+			client.curr_sn += 1
+			req.sn_res <- sn
 		}
 	}
 }
@@ -120,11 +135,10 @@ func (s *server) readRoutine() {
 				ack:            make(chan Message),
 				addr:           addr,
 				storedMessages: make(map[int]Message),
-				curr_sn_req:    make(chan int),
-				curr_sn_res:    make(chan int),
-				client_sn_req:  make(chan int),
-				client_sn_res:  make(chan int),
-				closed:         make(chan bool),
+				// curr_sn_req:    make(chan int),
+				// curr_sn_res:    make(chan int),
+				// client_sn_res:  make(chan int),
+				closed: make(chan bool),
 			}
 			s.new_client <- new_client
 		} else {
@@ -152,11 +166,27 @@ func (s *server) Read() (int, []byte, error) {
 }
 
 func (s *server) writeRoutine() {
-
+	for {
+		select {
+		case data := <-s.pendingMsgChan:
+			s.pendingMsgs.PushBack(data)
+		}
+	}
 }
 
 func (s *server) Write(connId int, payload []byte) error {
-
+	res := make(chan int)
+	req := write_req{
+		clientID: connId,
+		sn_res:   res,
+	}
+	s.client_sn_req <- req
+	sn := <-req.sn_res
+	//TODO: fix checksum
+	checksum := uint16(ByteArray2Checksum(payload))
+	data := NewData(connId, sn, len(payload), payload, checksum)
+	s.pendingMsgChan <- *data
+	return nil
 }
 
 func (s *server) CloseConn(connId int) error {
