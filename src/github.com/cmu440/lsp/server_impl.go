@@ -3,7 +3,6 @@
 package lsp
 
 import (
-	"container/list"
 	"encoding/json"
 	"errors"
 	"strconv"
@@ -16,12 +15,13 @@ type server struct {
 	client_num     int
 	conn           *lspnet.UDPConn
 	read_res       chan Message
-	pendingMsgs    *list.List
+	pendingMsgs    chan Message
 	pendingMsgChan chan Message
 	closed         bool
 	closeActivate  chan bool
 	readingClose   chan bool
 	reqChan        chan request
+	needToClose    bool
 }
 
 type request struct {
@@ -81,7 +81,7 @@ func NewServer(port int, params *Params) (Server, error) {
 		client_num:     1,
 		conn:           udpconn,
 		read_res:       make(chan Message),
-		pendingMsgs:    list.New(),
+		pendingMsgs:    make(chan Message),
 		pendingMsgChan: make(chan Message),
 		closed:         false,
 		closeActivate:  make(chan bool),
@@ -169,6 +169,17 @@ func (s *server) mapRequestHandler() {
 			}
 		case <-s.readingClose:
 			break
+		case msg, ok := <-s.pendingMsgs:
+			if !ok {
+				close(s.readingClose)
+			}
+			client := s.clientMap[msg.ConnID]
+			go s.writeMsg(client.addr, msg, client.ack)
+			client.toWrite -= 1
+			if client.toWrite == 0 && client.closeActivate {
+				delete(s.clientMap, msg.ConnID)
+			}
+
 		}
 		// fmt.Printf("Failed reqs: %d\n", failedReqs)
 		if failedReqs > 0 {
@@ -193,6 +204,12 @@ func (s *server) mapRequestHandler() {
 			}
 		}
 	}
+}
+
+func (s *server) writeMsg(addr *lspnet.UDPAddr, msg Message, ack chan Message) {
+	byte_msg, _ := json.Marshal(&(msg))
+	s.conn.WriteToUDP(byte_msg, addr)
+	<-ack
 }
 
 func (s *server) readRoutine() {
@@ -255,11 +272,11 @@ func (s *server) Read() (int, []byte, error) {
 }
 
 func (s *server) writeRoutine() {
-	var needToClose bool = false
+	// var needToClose bool = false
 	for {
 		select {
 		case data := <-s.pendingMsgChan:
-			s.pendingMsgs.PushBack(data)
+			s.pendingMsgs <- data
 			// fmt.Printf("Added data to queue: %+v\n", data)
 			req := request{
 				reqType:  AddPending,
@@ -267,42 +284,8 @@ func (s *server) writeRoutine() {
 			}
 			s.reqChan <- req
 		case <-s.closeActivate:
-			needToClose = true
-		default:
-			front := s.pendingMsgs.Front()
-			if front == nil {
-				if needToClose {
-					s.conn.Close()
-					//signal to stop reading
-					close(s.readingClose)
-					break
-				} else {
-					continue
-				}
-			}
-			s.pendingMsgs.Remove(front)
-
-			//get upd addr of client
-			msg, _ := front.Value.(Message)
-			req := request{
-				reqType:  ClientAddr,
-				clientID: msg.ConnID,
-				addr_res: make(chan *lspnet.UDPAddr),
-				ack_chan: make(chan chan Message),
-			}
-			s.reqChan <- req
-			//wait for result
-			addr := <-req.addr_res
-			ack := <-req.ack_chan
-			byte_msg, _ := json.Marshal(&(msg))
-			s.conn.WriteToUDP(byte_msg, addr)
-			remPending := request{
-				reqType:  RemovePending,
-				clientID: msg.ConnID,
-			}
-			s.reqChan <- remPending
-			//wait for acknowledgement
-			<-ack
+			close(s.pendingMsgs)
+			break
 		}
 	}
 }

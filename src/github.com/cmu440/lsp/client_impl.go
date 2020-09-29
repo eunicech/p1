@@ -3,7 +3,6 @@
 package lsp
 
 import (
-	"container/list"
 	"encoding/json"
 	"errors"
 
@@ -18,15 +17,15 @@ type client struct {
 	//backOff          int
 	//maxBackOff       int
 	//timer            *time.Ticker
-	clientID       int
-	conn           *lspnet.UDPConn
-	currSN         int      //keeps track of sequence numbers
-	serverSN       int      //keeps track of packets recieved
-	server_sn_res  chan int // get what packet # we are waiting for
-	get_server_sn  chan bool
-	client_sn_res  chan int // get what packet # we are writing
-	get_client_sn  chan int
-	pendingMsgs    *list.List
+	clientID      int
+	conn          *lspnet.UDPConn
+	currSN        int      //keeps track of sequence numbers
+	serverSN      int      //keeps track of packets recieved
+	server_sn_res chan int // get what packet # we are waiting for
+	get_server_sn chan bool
+	client_sn_res chan int // get what packet # we are writing
+	get_client_sn chan int
+	//pendingMsgs    *list.List
 	pendingMsgChan chan *Message
 	acks           chan Message
 	dataStorage    data
@@ -98,15 +97,15 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		//maxBackOff:     params.MaxBackOffInterval,
 		//maxUnackedMsgs: params.MaxUnackedMessages,
 		//timer:          time.NewTicker(time.Duration(1000000 * params.EpochMillis)),
-		clientID:       ack_msg.ConnID,
-		conn:           udp,
-		currSN:         1,
-		serverSN:       1,
-		server_sn_res:  make(chan int),
-		get_server_sn:  make(chan bool),
-		client_sn_res:  make(chan int),
-		get_client_sn:  make(chan int),
-		pendingMsgs:    list.New(),
+		clientID:      ack_msg.ConnID,
+		conn:          udp,
+		currSN:        1,
+		serverSN:      1,
+		server_sn_res: make(chan int),
+		get_server_sn: make(chan bool),
+		client_sn_res: make(chan int),
+		get_client_sn: make(chan int),
+		//pendingMsgs:    list.New(),
 		pendingMsgChan: make(chan *Message),
 		acks:           make(chan Message),
 		dataStorage:    dataStore,
@@ -201,31 +200,22 @@ func (c *client) readRoutine() {
 
 }
 
+func (c *client) writeMsg(msg Message) {
+	byte_msg, _ := json.Marshal(&msg)
+	c.conn.Write(byte_msg)
+	//wait for acknowledgement
+	<-c.acks
+}
+
 func (c *client) writeRoutine() {
-	var needToClose bool = false
+	//var needToClose bool = false
 	for {
 		select {
 		case <-c.closeActivate:
-			needToClose = true
+			close(c.dataStorage.closed)
+			break
 		case dataMsg := <-c.pendingMsgChan:
-			c.pendingMsgs.PushBack(dataMsg)
-		default:
-			msg := c.pendingMsgs.Front()
-			if msg == nil {
-				if needToClose {
-					c.conn.Close()
-					//signal to stop reading
-					close(c.dataStorage.closed)
-					break
-				} else {
-					continue
-				}
-			}
-			c.pendingMsgs.Remove(msg)
-			byte_msg, _ := json.Marshal(&(msg.Value))
-			c.conn.Write(byte_msg)
-			//wait for acknowledgement
-			<-c.acks
+			go c.writeMsg(*dataMsg)
 		}
 
 	}
