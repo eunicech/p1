@@ -168,7 +168,6 @@ func (c *client) readRequestsRoutine() {
 		if exists {
 			//remove the value
 			delete(c.dataStorage.pendingData, curr_req)
-
 			//add value to channel
 			curr_chan <- value
 		}
@@ -269,5 +268,6 @@ func (c *client) Close() error {
 		return errors.New("Client already closed")
 	}
 	close(c.closeActivate)
+	<-c.dataStorage.closed
 	return nil
 }
