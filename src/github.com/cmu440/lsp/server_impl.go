@@ -12,40 +12,64 @@ import (
 )
 
 type server struct {
-	clientMap       map[int]client_info
-	client_num      int
-	client_num_req  chan int
-	conn            *lspnet.UDPConn
-	add_msg         chan Message
-	new_client      chan client_info
-	read_req        chan bool
-	read_res        chan Message
-	pendingMsgs     *list.List
-	pendingMsgChan  chan Message
-	client_sn_req   chan write_req
-	client_addr_req chan addr_req
-	addPending      chan int
-	removePending   chan int
-	closeConn       chan close_req
-	closed          bool
-	closeActivate   chan bool
-	readingClose    chan bool
+	clientMap  map[int]client_info
+	client_num int
+	// client_num_req  chan int
+	conn *lspnet.UDPConn
+	// add_msg         chan Message
+	// new_client      chan client_info
+	// read_req        chan bool
+	read_res       chan Message
+	pendingMsgs    *list.List
+	pendingMsgChan chan Message
+	// client_sn_req   chan write_req
+	// client_addr_req chan addr_req
+	// addPending      chan int
+	// removePending   chan int
+	// closeConn       chan close_req
+	closed        bool
+	closeActivate chan bool
+	readingClose  chan bool
+	reqChan       chan request
 }
 
-type close_req struct {
-	clientID int
-	res      chan bool
+type request struct {
+	reqType      requestType
+	clientID     int
+	closeResChan chan bool
+	addr_res     chan *lspnet.UDPAddr
+	ack_chan     chan chan Message
+	sn_res       chan int
+	add_msg      chan Message
+	new_client   chan client_info
 }
+type requestType int
 
-type addr_req struct {
-	clientId int
-	addr_res chan *lspnet.UDPAddr
-	ack_chan chan chan Message
-}
-type write_req struct {
-	clientID int
-	sn_res   chan int
-}
+const (
+	AddClient requestType = iota
+	AddMsg
+	ReadReq
+	ClientSN
+	ClientAddr
+	AddPending
+	RemovePending
+	CloseCxn
+)
+
+// type close_req struct {
+// 	clientID int
+// 	res      chan bool
+// }
+
+// type addr_req struct {
+// 	clientId int
+// 	addr_res chan *lspnet.UDPAddr
+// 	ack_chan chan chan Message
+// }
+// type write_req struct {
+// 	clientID int
+// 	sn_res   chan int
+// }
 
 type client_info struct {
 	client_id      int
@@ -77,22 +101,16 @@ func NewServer(port int, params *Params) (Server, error) {
 		return nil, err
 	}
 	new_server := &server{
-		clientMap:       make(map[int]client_info),
-		client_num:      1,
-		client_num_req:  make(chan int),
-		conn:            udpconn,
-		add_msg:         make(chan Message),
-		new_client:      make(chan client_info),
-		read_req:        make(chan bool),
-		read_res:        make(chan Message),
-		pendingMsgs:     list.New(),
-		pendingMsgChan:  make(chan Message),
-		client_sn_req:   make(chan write_req),
-		client_addr_req: make(chan addr_req),
-		closeConn:       make(chan close_req),
-		closed:          false,
-		closeActivate:   make(chan bool),
-		readingClose:    make(chan bool),
+		clientMap:  make(map[int]client_info),
+		client_num: 1,
+		// client_num_req:  make(chan int),
+		conn:           udpconn,
+		read_res:       make(chan Message),
+		pendingMsgs:    list.New(),
+		pendingMsgChan: make(chan Message),
+		closed:         false,
+		closeActivate:  make(chan bool),
+		readingClose:   make(chan bool),
 	}
 	go new_server.writeRoutine()
 	go new_server.readRoutine()
@@ -102,72 +120,147 @@ func NewServer(port int, params *Params) (Server, error) {
 func (s *server) mapRequestHandler() {
 	for {
 		select {
-		case msg := <-s.add_msg:
-			client := s.clientMap[msg.ConnID]
-			switch msg.Type {
-			case MsgAck:
-				client.ack <- msg
-			case MsgData:
-				client.storedMessages[msg.SeqNum] = msg
-			}
-		case new_client := <-s.new_client:
-			new_client.client_id = s.client_num
-			s.client_num += 1
-			//send acknowledgement to client
-			ack, _ := json.Marshal(NewAck(new_client.client_id, 0))
-			s.conn.WriteToUDP(ack, new_client.addr)
-		case <-s.read_req:
-			var cr client_info
-			var found bool = false
-			for _, v := range s.clientMap {
-				_, ok := v.storedMessages[v.client_sn]
-				if ok {
-					cr = v
-					found = true
-					break
+		case req := <-s.reqChan:
+			switch req.reqType {
+			case AddClient:
+				new_client := <-req.new_client
+				new_client.client_id = s.client_num
+				s.client_num += 1
+				//send acknowledgement to client
+				ack, _ := json.Marshal(NewAck(new_client.client_id, 0))
+				s.conn.WriteToUDP(ack, new_client.addr)
+			case AddMsg:
+				client := s.clientMap[req.clientID]
+				msg := <-req.add_msg
+				switch msg.Type {
+				case MsgAck:
+					client.ack <- msg
+				case MsgData:
+					client.storedMessages[msg.SeqNum] = msg
 				}
-			}
-			if found {
-				res := cr.storedMessages[cr.client_sn]
-				delete(cr.storedMessages, cr.client_sn)
-				cr.client_sn += 1
-				s.read_res <- res
-			}
-		case req := <-s.client_sn_req:
-			client := s.clientMap[req.clientID]
-			sn := client.curr_sn
-			client.curr_sn += 1
-			req.sn_res <- sn
-		case req := <-s.client_addr_req:
-			client := s.clientMap[req.clientId]
-			req.addr_res <- client.addr
-			req.ack_chan <- client.ack
-		case clientID := <-s.addPending:
-			client := s.clientMap[clientID]
-			client.toWrite += 1
-		case clientID := <-s.removePending:
-			client := s.clientMap[clientID]
-			client.toWrite -= 1
-			if client.toWrite == 0 && client.closeActivate {
-				delete(s.clientMap, clientID)
-			}
-		case req := <-s.closeConn:
-			client, ok := s.clientMap[req.clientID]
-			if !ok {
-				req.res <- true
-			} else {
-				client.closeActivate = true
+			case ReadReq:
+				var cr client_info
+				var found bool = false
+				for _, v := range s.clientMap {
+					_, ok := v.storedMessages[v.client_sn]
+					if ok {
+						cr = v
+						found = true
+						break
+					}
+				}
+				if found {
+					res := cr.storedMessages[cr.client_sn]
+					delete(cr.storedMessages, cr.client_sn)
+					cr.client_sn += 1
+					s.read_res <- res
+				}
+			case ClientSN:
+				client := s.clientMap[req.clientID]
+				sn := client.curr_sn
+				client.curr_sn += 1
+				req.sn_res <- sn
+			case ClientAddr:
+				client := s.clientMap[req.clientID]
+				req.addr_res <- client.addr
+				req.ack_chan <- client.ack
+			case AddPending:
+				client := s.clientMap[req.clientID]
+				client.toWrite += 1
+			case RemovePending:
+				client := s.clientMap[req.clientID]
 				client.toWrite -= 1
 				if client.toWrite == 0 && client.closeActivate {
 					delete(s.clientMap, req.clientID)
 				}
-				req.res <- false
+			case CloseCxn:
+				client, ok := s.clientMap[req.clientID]
+				if !ok {
+					req.closeResChan <- true
+				} else {
+					client.closeActivate = true
+					client.toWrite -= 1
+					if client.toWrite == 0 && client.closeActivate {
+						delete(s.clientMap, req.clientID)
+					}
+					req.closeResChan <- false
+				}
 			}
 		case <-s.readingClose:
 			break
 		}
 	}
 }
+
+// func (s *server) mapRequestHandler() {
+// 	for {
+// 		select {
+// 		case msg := <-s.add_msg:
+// 			client := s.clientMap[msg.ConnID]
+// 			switch msg.Type {
+// 			case MsgAck:
+// 				client.ack <- msg
+// 			case MsgData:
+// 				client.storedMessages[msg.SeqNum] = msg
+// 			}
+// 		case new_client := <-s.new_client:
+// 			new_client.client_id = s.client_num
+// 			s.client_num += 1
+// 			//send acknowledgement to client
+// 			ack, _ := json.Marshal(NewAck(new_client.client_id, 0))
+// 			s.conn.WriteToUDP(ack, new_client.addr)
+// 		case <-s.read_req:
+// 			var cr client_info
+// 			var found bool = false
+// 			for _, v := range s.clientMap {
+// 				_, ok := v.storedMessages[v.client_sn]
+// 				if ok {
+// 					cr = v
+// 					found = true
+// 					break
+// 				}
+// 			}
+// 			if found {
+// 				res := cr.storedMessages[cr.client_sn]
+// 				delete(cr.storedMessages, cr.client_sn)
+// 				cr.client_sn += 1
+// 				s.read_res <- res
+// 			}
+// 		case req := <-s.client_sn_req:
+// 			client := s.clientMap[req.clientID]
+// 			sn := client.curr_sn
+// 			client.curr_sn += 1
+// 			req.sn_res <- sn
+// 		case req := <-s.client_addr_req:
+// 			client := s.clientMap[req.clientId]
+// 			req.addr_res <- client.addr
+// 			req.ack_chan <- client.ack
+// 		case clientID := <-s.addPending:
+// 			client := s.clientMap[clientID]
+// 			client.toWrite += 1
+// 		case clientID := <-s.removePending:
+// 			client := s.clientMap[clientID]
+// 			client.toWrite -= 1
+// 			if client.toWrite == 0 && client.closeActivate {
+// 				delete(s.clientMap, clientID)
+// 			}
+// 		case req := <-s.closeConn:
+// 			client, ok := s.clientMap[req.clientID]
+// 			if !ok {
+// 				req.res <- true
+// 			} else {
+// 				client.closeActivate = true
+// 				client.toWrite -= 1
+// 				if client.toWrite == 0 && client.closeActivate {
+// 					delete(s.clientMap, req.clientID)
+// 				}
+// 				req.res <- false
+// 			}
+// 		case <-s.readingClose:
+// 			break
+// 		}
+// 	}
+// }
 
 func (s *server) readRoutine() {
 	go s.mapRequestHandler()
@@ -192,7 +285,12 @@ func (s *server) readRoutine() {
 					toWrite:        0,
 					closeActivate:  false,
 				}
-				s.new_client <- new_client
+				req := request{
+					reqType:    AddClient,
+					new_client: make(chan client_info),
+				}
+				req.new_client <- new_client
+				s.reqChan <- req
 			} else {
 				//check if data message and need to send ack
 				if data.Type == MsgData {
@@ -200,8 +298,13 @@ func (s *server) readRoutine() {
 					ack, _ := json.Marshal(NewAck(data.ConnID, data.SeqNum))
 					s.conn.WriteToUDP(ack, addr)
 				}
-
-				s.add_msg <- data
+				req := request{
+					reqType:  AddMsg,
+					clientID: data.ConnID,
+					add_msg:  make(chan Message),
+				}
+				req.add_msg <- data
+				s.reqChan <- req
 			}
 		}
 	}
@@ -209,7 +312,10 @@ func (s *server) readRoutine() {
 
 func (s *server) Read() (int, []byte, error) {
 	//create request
-	s.read_req <- true
+	req := request{
+		reqType: ReadReq,
+	}
+	s.reqChan <- req
 	//wait for result
 	msg := <-s.read_res
 	return msg.ConnID, msg.Payload, nil
@@ -221,7 +327,11 @@ func (s *server) writeRoutine() {
 		select {
 		case data := <-s.pendingMsgChan:
 			s.pendingMsgs.PushBack(data)
-			s.addPending <- data.ConnID
+			req := request{
+				reqType:  AddPending,
+				clientID: data.ConnID,
+			}
+			s.reqChan <- req
 		case <-s.closeActivate:
 			needToClose = true
 		default:
@@ -240,33 +350,35 @@ func (s *server) writeRoutine() {
 
 			//get upd addr of client
 			msg, _ := front.Value.(Message)
-			res := make(chan *lspnet.UDPAddr)
-			ack_res := make(chan chan Message)
-			request := addr_req{
-				clientId: msg.ConnID,
-				addr_res: res,
-				ack_chan: ack_res,
+			req := request{
+				reqType:  ClientAddr,
+				clientID: msg.ConnID,
+				addr_res: make(chan *lspnet.UDPAddr),
+				ack_chan: make(chan chan Message),
 			}
-			s.client_addr_req <- request
+			s.reqChan <- req
 			//wait for result
-			addr := <-request.addr_res
+			addr := <-req.addr_res
 			byte_msg, _ := json.Marshal(&(msg))
 			s.conn.WriteToUDP(byte_msg, addr)
-			s.removePending <- msg.ConnID
+			remPending := request{
+				reqType:  RemovePending,
+				clientID: msg.ConnID,
+			}
+			s.reqChan <- remPending
 			//wait for acknowledgement
-			ack := <-request.ack_chan
+			ack := <-req.ack_chan
 			<-ack
 		}
 	}
 }
 
 func (s *server) Write(connId int, payload []byte) error {
-	res := make(chan int)
-	req := write_req{
+	req := request{
 		clientID: connId,
-		sn_res:   res,
+		sn_res:   make(chan int),
 	}
-	s.client_sn_req <- req
+	s.reqChan <- req
 	sn := <-req.sn_res
 	//TODO: fix checksum
 	checksum := uint16(ByteArray2Checksum(payload))
@@ -276,13 +388,13 @@ func (s *server) Write(connId int, payload []byte) error {
 }
 
 func (s *server) CloseConn(connId int) error {
-	err := make(chan bool)
-	req := close_req{
-		clientID: connId,
-		res:      err,
+	req := request{
+		reqType:      CloseCxn,
+		clientID:     connId,
+		closeResChan: make(chan bool),
 	}
-	s.closeConn <- req
-	hasError := <-err
+	s.reqChan <- req
+	hasError := <-req.closeResChan
 	if hasError {
 		return errors.New("Connection closed")
 	} else {
