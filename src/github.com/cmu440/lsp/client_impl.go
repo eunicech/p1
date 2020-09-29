@@ -41,10 +41,6 @@ type data struct {
 	closed      chan bool
 }
 
-//map
-//put into map
-//take out of map -> read req
-
 type readReq struct {
 	dataSN  int
 	dataRes chan Message
