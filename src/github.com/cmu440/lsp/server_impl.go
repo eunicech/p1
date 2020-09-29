@@ -12,7 +12,7 @@ import (
 )
 
 type server struct {
-	clientMap      map[int]client_info
+	clientMap      map[int]*client_info
 	client_num     int
 	conn           *lspnet.UDPConn
 	read_res       chan Message
@@ -31,8 +31,8 @@ type request struct {
 	addr_res     chan *lspnet.UDPAddr
 	ack_chan     chan chan Message
 	sn_res       chan int
-	add_msg      chan Message
-	new_client   chan client_info
+	add_msg      Message
+	new_client   *client_info
 }
 type requestType int
 
@@ -77,9 +77,8 @@ func NewServer(port int, params *Params) (Server, error) {
 		return nil, err
 	}
 	new_server := &server{
-		clientMap:  make(map[int]client_info),
-		client_num: 1,
-		// client_num_req:  make(chan int),
+		clientMap:      make(map[int]*client_info),
+		client_num:     1,
 		conn:           udpconn,
 		read_res:       make(chan Message),
 		pendingMsgs:    list.New(),
@@ -87,6 +86,7 @@ func NewServer(port int, params *Params) (Server, error) {
 		closed:         false,
 		closeActivate:  make(chan bool),
 		readingClose:   make(chan bool),
+		reqChan:        make(chan request),
 	}
 	go new_server.writeRoutine()
 	go new_server.readRoutine()
@@ -94,20 +94,22 @@ func NewServer(port int, params *Params) (Server, error) {
 }
 
 func (s *server) mapRequestHandler() {
+	var failedReqs int = 0
 	for {
 		select {
 		case req := <-s.reqChan:
 			switch req.reqType {
 			case AddClient:
-				new_client := <-req.new_client
-				new_client.client_id = s.client_num
+				client := req.new_client
+				client.client_id = s.client_num
 				s.client_num += 1
 				//send acknowledgement to client
-				ack, _ := json.Marshal(NewAck(new_client.client_id, 0))
-				s.conn.WriteToUDP(ack, new_client.addr)
+				ack, _ := json.Marshal(NewAck(client.client_id, 0))
+				s.conn.WriteToUDP(ack, client.addr)
+				s.clientMap[client.client_id] = client
 			case AddMsg:
 				client := s.clientMap[req.clientID]
-				msg := <-req.add_msg
+				msg := req.add_msg
 				switch msg.Type {
 				case MsgAck:
 					client.ack <- msg
@@ -115,7 +117,7 @@ func (s *server) mapRequestHandler() {
 					client.storedMessages[msg.SeqNum] = msg
 				}
 			case ReadReq:
-				var cr client_info
+				var cr *client_info
 				var found bool = false
 				for _, v := range s.clientMap {
 					_, ok := v.storedMessages[v.client_sn]
@@ -130,6 +132,9 @@ func (s *server) mapRequestHandler() {
 					delete(cr.storedMessages, cr.client_sn)
 					cr.client_sn += 1
 					s.read_res <- res
+					// fmt.Printf("CLIENT SN: %d\n", cr.client_sn)
+				} else {
+					failedReqs += 1
 				}
 			case ClientSN:
 				client := s.clientMap[req.clientID]
@@ -165,6 +170,28 @@ func (s *server) mapRequestHandler() {
 		case <-s.readingClose:
 			break
 		}
+		// fmt.Printf("Failed reqs: %d\n", failedReqs)
+		if failedReqs > 0 {
+			var cr *client_info
+			var found bool = false
+			for _, v := range s.clientMap {
+				// fmt.Println("Curr: " + strconv.Itoa(v.client_sn))
+				_, ok := v.storedMessages[v.client_sn]
+				if ok {
+					cr = v
+					found = true
+					break
+				}
+			}
+			if found {
+				res := cr.storedMessages[cr.client_sn]
+				delete(cr.storedMessages, cr.client_sn)
+				cr.client_sn = cr.client_sn + 1
+				// fmt.Printf("CLIENT SN: %d\n", cr.client_sn)
+				s.read_res <- res
+				failedReqs -= 1
+			}
+		}
 	}
 }
 
@@ -180,8 +207,9 @@ func (s *server) readRoutine() {
 			var data Message
 			json.Unmarshal(packet[:bytesRead], &data)
 			//check if its a connection message
+			// fmt.Printf("Unmarshalled: %+v\n", data)
 			if data.Type == MsgConnect {
-				new_client := client_info{
+				nc := &client_info{
 					curr_sn:        1,
 					client_sn:      1,
 					ack:            make(chan Message),
@@ -193,9 +221,8 @@ func (s *server) readRoutine() {
 				}
 				req := request{
 					reqType:    AddClient,
-					new_client: make(chan client_info),
+					new_client: nc,
 				}
-				req.new_client <- new_client
 				s.reqChan <- req
 			} else {
 				//check if data message and need to send ack
@@ -207,9 +234,8 @@ func (s *server) readRoutine() {
 				req := request{
 					reqType:  AddMsg,
 					clientID: data.ConnID,
-					add_msg:  make(chan Message),
+					add_msg:  data,
 				}
-				req.add_msg <- data
 				s.reqChan <- req
 			}
 		}
@@ -218,6 +244,7 @@ func (s *server) readRoutine() {
 
 func (s *server) Read() (int, []byte, error) {
 	//create request
+	// fmt.Println("called read")
 	req := request{
 		reqType: ReadReq,
 	}
@@ -233,6 +260,7 @@ func (s *server) writeRoutine() {
 		select {
 		case data := <-s.pendingMsgChan:
 			s.pendingMsgs.PushBack(data)
+			// fmt.Printf("Added data to queue: %+v\n", data)
 			req := request{
 				reqType:  AddPending,
 				clientID: data.ConnID,
@@ -265,6 +293,7 @@ func (s *server) writeRoutine() {
 			s.reqChan <- req
 			//wait for result
 			addr := <-req.addr_res
+			ack := <-req.ack_chan
 			byte_msg, _ := json.Marshal(&(msg))
 			s.conn.WriteToUDP(byte_msg, addr)
 			remPending := request{
@@ -273,23 +302,27 @@ func (s *server) writeRoutine() {
 			}
 			s.reqChan <- remPending
 			//wait for acknowledgement
-			ack := <-req.ack_chan
 			<-ack
 		}
 	}
 }
 
 func (s *server) Write(connId int, payload []byte) error {
+	// fmt.Println("called write")
 	req := request{
+		reqType:  ClientSN,
 		clientID: connId,
 		sn_res:   make(chan int),
 	}
 	s.reqChan <- req
+	// fmt.Println("Probs stuck here")
 	sn := <-req.sn_res
 	//TODO: fix checksum
 	checksum := uint16(ByteArray2Checksum(payload))
 	data := NewData(connId, sn, len(payload), payload, checksum)
+	// fmt.Println("before adding write msg")
 	s.pendingMsgChan <- *data
+	// fmt.Println("added write msg")
 	return nil
 }
 
