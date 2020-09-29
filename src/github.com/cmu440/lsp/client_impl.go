@@ -6,7 +6,6 @@ import (
 	"container/list"
 	"encoding/json"
 	"errors"
-	"fmt"
 
 	"github.com/cmu440/lspnet"
 )
@@ -24,11 +23,11 @@ type client struct {
 	currSN         int      //keeps track of sequence numbers
 	serverSN       int      //keeps track of packets recieved
 	server_sn_res  chan int // get what packet # we are waiting for
-	get_server_sn  chan int
+	get_server_sn  chan bool
 	client_sn_res  chan int // get what packet # we are writing
 	get_client_sn  chan int
 	pendingMsgs    *list.List
-	pendingMsgChan chan Message
+	pendingMsgChan chan *Message
 	acks           chan Message
 	dataStorage    data
 	closeActivate  chan bool
@@ -77,36 +76,26 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		return nil, err
 	}
 
-	fmt.Println("going to write")
 	udp.Write(msg)
-	fmt.Println("finished write")
-
 	// wait for acknowledgement
 	var ack_msg Message
-	for {
-		var temp Message
-		var ack []byte = make([]byte, 0, 2000)
-		fmt.Println("going to read")
-		bytesRead, err := udp.Read(ack)
-		fmt.Println("finished read")
-		if err != nil {
-			return nil, err
-		}
-		json.Unmarshal(ack[:bytesRead], &temp)
-		fmt.Printf("if %+v\n", temp)
-		if temp.Type == MsgAck && temp.SeqNum == 0 {
-			ack_msg = temp
-			break
-		}
+	var ack [2000]byte
+	bytesRead, err := udp.Read(ack[0:])
+	if err != nil {
+		return nil, err
+	}
+	json.Unmarshal(ack[:bytesRead], &ack_msg)
+	if ack_msg.Type != MsgAck || ack_msg.SeqNum != 0 {
+		return nil, errors.New("Not an acknowledgement")
 	}
 
-	fmt.Println(ack_msg)
 	dataStore := data{
 		read_reqs:   make(chan readReq),
 		pendingData: make(map[int]Message),
 		addData:     make(chan Message),
 		closed:      make(chan bool),
 	}
+
 	new_client := &client{
 		//epochLimit:     params.EpochLimit,
 		//windowSize:     params.WindowSize,
@@ -118,9 +107,11 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		currSN:         1,
 		serverSN:       1,
 		server_sn_res:  make(chan int),
-		get_server_sn:  make(chan int),
+		get_server_sn:  make(chan bool),
+		client_sn_res:  make(chan int),
+		get_client_sn:  make(chan int),
 		pendingMsgs:    list.New(),
-		pendingMsgChan: make(chan Message),
+		pendingMsgChan: make(chan *Message),
 		acks:           make(chan Message),
 		dataStorage:    dataStore,
 		closeActivate:  make(chan bool),
@@ -129,20 +120,16 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	go new_client.clientInfoRequests()
 	go new_client.writeRoutine()
 	go new_client.readRoutine()
+	go new_client.readRequestsRoutine()
 	return new_client, nil
 }
 
 func (c *client) clientInfoRequests() {
 	for {
 		select {
-		case add := <-c.get_server_sn:
-			if add < 0 {
-				//this is a request to get the serverSN
-				c.server_sn_res <- c.serverSN
-			} else {
-				//this is request to add to serverSN
-				c.serverSN += add
-			}
+		case <-c.get_server_sn:
+			c.server_sn_res <- c.serverSN
+			c.serverSN += 1
 		case add := <-c.get_client_sn:
 			if add < 0 {
 				//this is a request to get the currSN
@@ -189,28 +176,30 @@ func (c *client) readRequestsRoutine() {
 }
 
 func (c *client) readRoutine() {
-	go c.readRequestsRoutine()
 	for {
 		select {
 		case <-c.dataStorage.closed:
 			break
 		default:
 			//read message from server
-			var packet []byte = make([]byte, 0, 2000)
-			bytesRead, _ := c.conn.Read(packet)
-			var data *Message = new(Message)
-			json.Unmarshal(packet[:bytesRead], data)
+			var packet [2000]byte
+			bytesRead, _ := c.conn.Read(packet[0:])
+			var data Message
+			json.Unmarshal(packet[:bytesRead], &data)
 
 			//check if this an acknowledgement
 			if data.Type == MsgAck {
-				c.acks <- *data
+				//ignore heartbeats
+				if data.SeqNum != 0 {
+					c.acks <- data
+				}
+			} else {
+				//data message
+				ack, _ := json.Marshal(NewAck(c.clientID, data.SeqNum))
+				c.conn.Write(ack)
+				c.dataStorage.addData <- data
 			}
 			//TODO: check if it is a heartbeat message
-
-			//data message
-			ack, _ := json.Marshal(NewAck(c.clientID, data.SeqNum))
-			c.conn.Write(ack)
-			c.dataStorage.addData <- *data
 
 		}
 	}
@@ -237,7 +226,8 @@ func (c *client) writeRoutine() {
 					continue
 				}
 			}
-			byte_msg, _ := json.Marshal(msg.Value)
+			c.pendingMsgs.Remove(msg)
+			byte_msg, _ := json.Marshal(&(msg.Value))
 			c.conn.Write(byte_msg)
 			//wait for acknowledgement
 			<-c.acks
@@ -248,7 +238,7 @@ func (c *client) writeRoutine() {
 
 func (c *client) Read() ([]byte, error) {
 	//get number of data packet you need to read
-	c.get_server_sn <- -1
+	c.get_server_sn <- true
 	sn := <-c.server_sn_res
 	result := make(chan Message)
 	//create read request
@@ -259,8 +249,6 @@ func (c *client) Read() ([]byte, error) {
 	c.dataStorage.read_reqs <- request
 	//wait for data
 	data := <-request.dataRes
-	//increase server_sn
-	c.get_server_sn <- 1
 
 	return data.Payload, nil
 }
@@ -270,7 +258,7 @@ func (c *client) Write(payload []byte) error {
 	sn := <-c.client_sn_res
 	checksum := uint16(ByteArray2Checksum(payload))
 	dataMsg := NewData(c.clientID, sn, len(payload), payload, checksum)
-	c.pendingMsgChan <- *dataMsg
+	c.pendingMsgChan <- dataMsg
 	c.get_client_sn <- 1
 	return nil
 }
