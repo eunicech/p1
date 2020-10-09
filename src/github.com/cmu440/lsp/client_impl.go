@@ -3,6 +3,7 @@
 package lsp
 
 import (
+	"container/list"
 	"encoding/json"
 	"errors"
 
@@ -24,9 +25,10 @@ type client struct {
 	server_sn_res chan int // get what packet # we are waiting for
 	get_server_sn chan bool
 	client_sn_res chan int // get what packet # we are writing
-	get_client_sn chan int
-	//pendingMsgs    *list.List
-	pendingMsgChan chan *Message
+	get_client_sn chan bool
+	pendingMsgs   *list.List
+	// pendingMsgChan chan *Message
+	pendingMsgChan chan []byte
 	acks           chan Message
 	dataStorage    data
 	closeActivate  chan bool
@@ -104,9 +106,9 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		server_sn_res: make(chan int),
 		get_server_sn: make(chan bool),
 		client_sn_res: make(chan int),
-		get_client_sn: make(chan int),
+		get_client_sn: make(chan bool),
 		//pendingMsgs:    list.New(),
-		pendingMsgChan: make(chan *Message),
+		pendingMsgChan: make(chan []byte),
 		acks:           make(chan Message),
 		dataStorage:    dataStore,
 		closeActivate:  make(chan bool),
@@ -125,14 +127,9 @@ func (c *client) clientInfoRequests() {
 		case <-c.get_server_sn:
 			c.server_sn_res <- c.serverSN
 			c.serverSN += 1
-		case add := <-c.get_client_sn:
-			if add < 0 {
-				//this is a request to get the currSN
-				c.client_sn_res <- c.currSN
-			} else {
-				//this is request to add to currSN
-				c.currSN += add
-			}
+		case <-c.get_client_sn:
+			c.client_sn_res <- c.currSN
+			c.currSN += 1
 		case <-c.closeActivate:
 			c.closed = true
 			break
@@ -200,7 +197,7 @@ func (c *client) readRoutine() {
 
 }
 
-func (c *client) writeMsg(msg Message) {
+func (c *client) writeMsg(msg Message ) {
 	byte_msg, _ := json.Marshal(&msg)
 	c.conn.Write(byte_msg)
 	//wait for acknowledgement
@@ -214,8 +211,22 @@ func (c *client) writeRoutine() {
 		case <-c.closeActivate:
 			close(c.dataStorage.closed)
 			break
-		case dataMsg := <-c.pendingMsgChan:
-			go c.writeMsg(*dataMsg)
+		case payload := <-c.pendingMsgChan:
+			//create dataMsg
+			c.get_client_sn <- true
+			sn := <-c.client_sn_res
+			checksum := uint16(ByteArray2Checksum(payload))
+			dataMsg := NewData(c.clientID, sn, len(payload), payload, checksum)
+			c.pendingMsgs.PushBack(dataMsg)
+			//go c.writeMsg(*dataMsg)
+		case ack := <- c.acks
+			
+			//put ack in corresponding thing
+			//check 1st 
+			//if first is good -> loop through
+			//update sliding window
+			//spawn any new goroutines
+
 		}
 
 	}
@@ -239,12 +250,7 @@ func (c *client) Read() ([]byte, error) {
 }
 
 func (c *client) Write(payload []byte) error {
-	c.get_client_sn <- -1
-	sn := <-c.client_sn_res
-	checksum := uint16(ByteArray2Checksum(payload))
-	dataMsg := NewData(c.clientID, sn, len(payload), payload, checksum)
-	c.pendingMsgChan <- dataMsg
-	c.get_client_sn <- 1
+	c.pendingMsgChan <- payload
 	return nil
 }
 
