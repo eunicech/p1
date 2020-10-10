@@ -13,33 +13,35 @@ import (
 
 type client struct {
 	//epoch          int
-	//epochLimit       int
+	epochLimit int
 	windowSize int
 	//maxUnackedMsgs   int
-	maxBackOff    int
-	epochSize     int
-	ticker        *time.Ticker
-	timer         *time.Time
-	clientID      int
-	conn          *lspnet.UDPConn
-	currSN        int      //keeps track of sequence numbers
-	serverSN      int      //keeps track of packets recieved
-	server_sn_res chan int // get what packet # we are waiting for
-	get_server_sn chan bool
-	client_sn_res chan int // get what packet # we are writing
-	get_client_sn chan bool
-	window        *slidingWindow
-	acks          chan Message
-	dataStorage   data
-	closeActivate chan bool
-	closed        bool
-	wroteInEpoch  bool
-	writtenChan   chan bool
-	signalEpoch   chan bool
+	maxBackOff      int
+	epochSize       int
+	ticker          *time.Ticker
+	timer           *time.Time
+	clientID        int
+	conn            *lspnet.UDPConn
+	currSN          int      //keeps track of sequence numbers
+	serverSN        int      //keeps track of packets recieved
+	server_sn_res   chan int // get what packet # we are waiting for
+	get_server_sn   chan bool
+	client_sn_res   chan int // get what packet # we are writing
+	get_client_sn   chan bool
+	window          *slidingWindow
+	acks            chan Message
+	dataStorage     data
+	closeActivate   chan bool
+	closed          bool
+	wroteInEpoch    bool
+	writtenChan     chan bool
+	signalEpoch     chan bool
+	unwrittenEpochs int
+	readInEpoch     bool
 }
 
 type data struct {
-	read_reqs   chan readReq
+	readReqs    chan readReq
 	pendingData map[int]Message
 	addData     chan Message
 	closed      chan bool
@@ -85,7 +87,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	}
 
 	dataStore := data{
-		read_reqs:   make(chan readReq),
+		readReqs:    make(chan readReq),
 		pendingData: make(map[int]Message),
 		addData:     make(chan Message),
 		closed:      make(chan bool),
@@ -95,8 +97,8 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		pendingMsgs:    list.New(),
 		pendingMsgChan: make(chan []byte),
 	}
-	new_client := &client{
-		//epochLimit:     params.EpochLimit,
+	newClient := &client{
+		epochLimit: params.EpochLimit,
 		windowSize: params.WindowSize,
 		maxBackOff: params.MaxBackOffInterval,
 		//maxUnackedMsgs: params.MaxUnackedMessages,
@@ -136,7 +138,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	var flag bool = false
 	for {
 		select {
-		case <-new_client.ticker.C:
+		case <-newClient.ticker.C:
 			epochsPassed += 1
 			if epochsPassed > currentBackOff {
 				udp.Write(msg)
@@ -164,12 +166,12 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	new_client.clientID = ack_msg.ConnID
-	go new_client.clientInfoRequests()
-	go new_client.writeRoutine()
-	go new_client.readRoutine()
-	go new_client.readRequestsRoutine()
-	return new_client, nil
+	newClient.clientID = ack_msg.ConnID
+	go newClient.clientInfoRequests()
+	go newClient.writeRoutine()
+	go newClient.readRoutine()
+	go newClient.readRequestsRoutine()
+	return newClient, nil
 }
 
 func readConnection(ack_chan chan Message, udp *lspnet.UDPConn, err_chan chan error) {
@@ -226,7 +228,7 @@ func (c *client) readRequestsRoutine() {
 	var curr_chan chan Message
 	for {
 		select {
-		case req := <-c.dataStorage.read_reqs:
+		case req := <-c.dataStorage.readReqs:
 			//assumes another read request from client can't come until this one is fulfilled
 			curr_req = req.dataSN
 			curr_chan = req.dataRes
@@ -268,6 +270,10 @@ func (c *client) readRoutine() {
 				//data message
 				ack, _ := json.Marshal(NewAck(c.clientID, data.SeqNum))
 				c.conn.Write(ack)
+				select {
+				case c.writtenChan <- true:
+				default:
+				}
 				c.dataStorage.addData <- data
 			}
 			//TODO: check if it is a heartbeat message
@@ -282,6 +288,10 @@ func (c *client) writeMsg(msg Message, ackChan chan Message, sigEpoch chan bool)
 	var currentBackOff int = 0
 	var epochsPassed int = 0
 	c.conn.Write(byte_msg)
+	select {
+	case c.writtenChan <- true:
+	default:
+	}
 	for {
 		select {
 		case <-ackChan:
@@ -290,6 +300,10 @@ func (c *client) writeMsg(msg Message, ackChan chan Message, sigEpoch chan bool)
 			epochsPassed += 1
 			if epochsPassed > currentBackOff {
 				c.conn.Write(byte_msg)
+				select {
+				case c.writtenChan <- true:
+				default:
+				}
 				epochsPassed = 0
 				if currentBackOff == 0 {
 					currentBackOff = 1
@@ -335,7 +349,7 @@ func (c *client) writeRoutine() {
 				if !currElem.gotAck {
 					currElem.signalEpoch <- true
 				}
-				count += 1
+				count++
 			}
 		case ack := <-c.acks:
 			//put ack in corresponding channel
@@ -383,7 +397,7 @@ func (c *client) Read() ([]byte, error) {
 		dataSN:  sn,
 		dataRes: result,
 	}
-	c.dataStorage.read_reqs <- request
+	c.dataStorage.readReqs <- request
 	//wait for data
 	data := <-request.dataRes
 
