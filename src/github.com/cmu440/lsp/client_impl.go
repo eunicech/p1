@@ -16,28 +16,29 @@ type client struct {
 	epochLimit int
 	windowSize int
 	//maxUnackedMsgs   int
-	maxBackOff      int
-	epochSize       int
-	ticker          *time.Ticker
-	timer           *time.Time
-	clientID        int
-	conn            *lspnet.UDPConn
-	currSN          int      //keeps track of sequence numbers
-	serverSN        int      //keeps track of packets recieved
-	server_sn_res   chan int // get what packet # we are waiting for
-	get_server_sn   chan bool
-	client_sn_res   chan int // get what packet # we are writing
-	get_client_sn   chan bool
-	window          *slidingWindow
-	acks            chan Message
-	dataStorage     data
-	closeActivate   chan bool
-	closed          bool
-	wroteInEpoch    bool
-	writtenChan     chan bool
-	signalEpoch     chan bool
-	unwrittenEpochs int
-	readInEpoch     bool
+	maxBackOff    int
+	epochSize     int
+	ticker        *time.Ticker
+	timer         *time.Time
+	clientID      int
+	conn          *lspnet.UDPConn
+	currSN        int      //keeps track of sequence numbers
+	serverSN      int      //keeps track of packets recieved
+	server_sn_res chan int // get what packet # we are waiting for
+	get_server_sn chan bool
+	client_sn_res chan int // get what packet # we are writing
+	get_client_sn chan bool
+	window        *slidingWindow
+	acks          chan Message
+	dataStorage   data
+	closeActivate chan bool
+	closed        bool
+	wroteInEpoch  bool
+	writtenChan   chan bool
+	signalEpoch   chan bool
+	unreadEpochs  int
+	readInEpoch   bool
+	readChan      chan bool
 }
 
 type data struct {
@@ -119,6 +120,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		closeActivate: make(chan bool),
 		closed:        false,
 		signalEpoch:   make(chan bool),
+		readChan:      make(chan bool),
 	}
 
 	var epochsPassed int = 0
@@ -213,8 +215,19 @@ func (c *client) clientInfoRequests() {
 				c.wroteInEpoch = false
 				c.signalEpoch <- true
 			}
+
+			if !c.readInEpoch {
+				// increment the number of epochs in which we haven't heard anything
+				c.unreadEpochs++
+				if c.unreadEpochs >= c.epochLimit {
+					// TODO: drop the client/ connection
+				}
+			}
 		case <-c.writtenChan:
 			c.wroteInEpoch = true
+		case <-c.readChan:
+			c.readInEpoch = true
+			c.unreadEpochs = 0
 		}
 	}
 }
@@ -236,7 +249,6 @@ func (c *client) readRequestsRoutine() {
 			c.dataStorage.pendingData[packet.SeqNum] = packet
 		case <-c.dataStorage.closed:
 			break
-
 		}
 		value, exists := c.dataStorage.pendingData[curr_req]
 		if exists {
@@ -259,6 +271,11 @@ func (c *client) readRoutine() {
 			bytesRead, _ := c.conn.Read(packet[0:])
 			var data Message
 			json.Unmarshal(packet[:bytesRead], &data)
+
+			select {
+			case c.readChan <- true:
+			default:
+			}
 
 			//check if this an acknowledgement
 			if data.Type == MsgAck {
