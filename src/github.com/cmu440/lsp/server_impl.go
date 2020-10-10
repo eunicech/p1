@@ -16,10 +16,10 @@ type server struct {
 	epochLimit     int
 	windowSize     int
 	maxBackOff     int
-	clientMap      map[int]*client_info
-	client_num     int
+	clientMap      map[int]*clientInfo
+	clientNum      int
 	conn           *lspnet.UDPConn
-	read_res       chan Message
+	readRes        chan Message
 	pendingMsgs    chan Message
 	pendingMsgChan chan Message
 	closed         bool
@@ -37,28 +37,26 @@ type request struct {
 	clientID     int
 	closeResChan chan bool
 	data         []byte
-	addr_res     chan *lspnet.UDPAddr
-	ack_chan     chan chan Message
-	sn_res       chan int
-	add_msg      *Message
-	new_client   *client_info
+	ackChan      chan chan Message
+	snRes        chan int
+	addMsg       *Message
+	newClient    *clientInfo
 }
 type requestType int
 
+//Type of request we are making to server
 const (
 	AddClient requestType = iota
 	AddMsg
 	ReadReq
-	ClientSN
-	ClientAddr
 	CloseCxn
 	WriteMessage
 )
 
-type client_info struct {
-	client_id      int
-	curr_sn        int
-	client_sn      int
+type clientInfo struct {
+	clientID       int
+	currSN         int
+	clientSN       int
 	ack            chan Message
 	addr           *lspnet.UDPAddr
 	storedMessages map[int]Message
@@ -99,14 +97,14 @@ func NewServer(port int, params *Params) (Server, error) {
 		return nil, err
 	}
 
-	new_server := &server{
+	newServer := &server{
 		epochLimit:     params.EpochLimit,
 		windowSize:     params.WindowSize,
 		maxBackOff:     params.MaxBackOffInterval,
-		clientMap:      make(map[int]*client_info),
-		client_num:     1,
+		clientMap:      make(map[int]*clientInfo),
+		clientNum:      1,
 		conn:           udpconn,
-		read_res:       make(chan Message),
+		readRes:        make(chan Message),
 		pendingMsgs:    make(chan Message),
 		pendingMsgChan: make(chan Message),
 		closed:         false,
@@ -118,8 +116,8 @@ func NewServer(port int, params *Params) (Server, error) {
 		ticker:         time.NewTicker(time.Duration(1000000 * params.EpochMillis)),
 	}
 
-	go new_server.readRoutine()
-	return new_server, nil
+	go newServer.readRoutine()
+	return newServer, nil
 }
 
 func (s *server) mapRequestHandler() {
@@ -129,16 +127,16 @@ func (s *server) mapRequestHandler() {
 		case req := <-s.reqChan:
 			switch req.reqType {
 			case AddClient:
-				client := req.new_client
-				client.client_id = s.client_num
-				s.client_num++
+				client := req.newClient
+				client.clientID = s.clientNum
+				s.clientNum++
 				//send acknowledgement to client
-				ack, _ := json.Marshal(NewAck(client.client_id, 0))
+				ack, _ := json.Marshal(NewAck(client.clientID, 0))
 				s.conn.WriteToUDP(ack, client.addr)
-				s.clientMap[client.client_id] = client
+				s.clientMap[client.clientID] = client
 			case AddMsg:
 				client := s.clientMap[req.clientID]
-				msg := req.add_msg
+				msg := req.addMsg
 				switch msg.Type {
 				case MsgAck:
 					ack := msg
@@ -172,10 +170,10 @@ func (s *server) mapRequestHandler() {
 					client.storedMessages[msg.SeqNum] = *msg
 				}
 			case ReadReq:
-				var cr *client_info
+				var cr *clientInfo
 				var found bool = false
 				for _, v := range s.clientMap {
-					_, ok := v.storedMessages[v.client_sn]
+					_, ok := v.storedMessages[v.clientSN]
 					if ok {
 						cr = v
 						found = true
@@ -183,24 +181,19 @@ func (s *server) mapRequestHandler() {
 					}
 				}
 				if found {
-					res := cr.storedMessages[cr.client_sn]
-					delete(cr.storedMessages, cr.client_sn)
-					cr.client_sn++
-					s.read_res <- res
+					res := cr.storedMessages[cr.clientSN]
+					delete(cr.storedMessages, cr.clientSN)
+					cr.clientSN++
+					s.readRes <- res
 					// fmt.Printf("CLIENT SN: %d\n", cr.client_sn)
 				} else {
 					failedReqs++
 				}
-			case ClientSN:
-				client := s.clientMap[req.clientID]
-				sn := client.curr_sn
-				client.curr_sn++
-				req.sn_res <- sn
 			case WriteMessage:
 				// get the current client sn and update it accordingly
 				client := s.clientMap[req.clientID]
-				sn := client.curr_sn
-				client.curr_sn++
+				sn := client.currSN
+				client.currSN++
 
 				// create msg
 				payload := req.data
@@ -228,7 +221,7 @@ func (s *server) mapRequestHandler() {
 					req.closeResChan <- true
 				} else {
 					client.closeActivate = true
-					client.toWrite -= 1
+					client.toWrite--
 					if client.toWrite == 0 && client.closeActivate {
 						delete(s.clientMap, req.clientID)
 					}
@@ -255,11 +248,11 @@ func (s *server) mapRequestHandler() {
 		}
 
 		if failedReqs > 0 {
-			var cr *client_info
+			var cr *clientInfo
 			var found bool = false
 			for _, v := range s.clientMap {
 				// fmt.Println("Curr: " + strconv.Itoa(v.client_sn))
-				_, ok := v.storedMessages[v.client_sn]
+				_, ok := v.storedMessages[v.clientSN]
 				if ok {
 					cr = v
 					found = true
@@ -267,11 +260,11 @@ func (s *server) mapRequestHandler() {
 				}
 			}
 			if found {
-				res := cr.storedMessages[cr.client_sn]
-				delete(cr.storedMessages, cr.client_sn)
-				cr.client_sn = cr.client_sn + 1
+				res := cr.storedMessages[cr.clientSN]
+				delete(cr.storedMessages, cr.clientSN)
+				cr.clientSN = cr.clientSN + 1
 				// fmt.Printf("CLIENT SN: %d\n", cr.client_sn)
-				s.read_res <- res
+				s.readRes <- res
 				failedReqs--
 			}
 		}
@@ -279,8 +272,8 @@ func (s *server) mapRequestHandler() {
 }
 
 func (s *server) writeMsg(addr *lspnet.UDPAddr, msg Message, ack chan Message, newSignalEpoch chan bool) {
-	byte_msg, _ := json.Marshal(&(msg))
-	s.conn.WriteToUDP(byte_msg, addr)
+	byteMsg, _ := json.Marshal(&(msg))
+	s.conn.WriteToUDP(byteMsg, addr)
 	var flag = false
 	var currentBackOff int = 0
 	var epochsPassed int = 0
@@ -291,7 +284,7 @@ func (s *server) writeMsg(addr *lspnet.UDPAddr, msg Message, ack chan Message, n
 		case <-newSignalEpoch:
 			epochsPassed++
 			if epochsPassed > currentBackOff {
-				s.conn.WriteToUDP(byte_msg, addr)
+				s.conn.WriteToUDP(byteMsg, addr)
 				epochsPassed = 0
 				if currentBackOff != s.maxBackOff {
 					if currentBackOff == 0 {
@@ -309,9 +302,6 @@ func (s *server) writeMsg(addr *lspnet.UDPAddr, msg Message, ack chan Message, n
 			break
 		}
 	}
-
-	// Deal with backoff later
-	<-ack
 }
 
 func (s *server) readRoutine() {
@@ -332,9 +322,9 @@ func (s *server) readRoutine() {
 					start:       1,
 					pendingMsgs: list.New(),
 				}
-				nc := &client_info{
-					curr_sn:        1,
-					client_sn:      1,
+				nc := &clientInfo{
+					currSN:         1,
+					clientSN:       1,
 					ack:            make(chan Message),
 					addr:           addr,
 					storedMessages: make(map[int]Message),
@@ -344,8 +334,8 @@ func (s *server) readRoutine() {
 					slidingWin:     newWindow,
 				}
 				req := request{
-					reqType:    AddClient,
-					new_client: nc,
+					reqType:   AddClient,
+					newClient: nc,
 				}
 				s.reqChan <- req
 			} else {
@@ -358,7 +348,7 @@ func (s *server) readRoutine() {
 				req := request{
 					reqType:  AddMsg,
 					clientID: data.ConnID,
-					add_msg:  &data,
+					addMsg:   &data,
 				}
 				s.reqChan <- req
 			}
@@ -374,7 +364,7 @@ func (s *server) Read() (int, []byte, error) {
 	}
 	s.reqChan <- req
 	//wait for result
-	msg := <-s.read_res
+	msg := <-s.readRes
 	return msg.ConnID, msg.Payload, nil
 }
 
@@ -392,10 +382,10 @@ func (s *server) Write(connID int, payload []byte) error {
 	return nil
 }
 
-func (s *server) CloseConn(connId int) error {
+func (s *server) CloseConn(connID int) error {
 	req := request{
 		reqType:      CloseCxn,
-		clientID:     connId,
+		clientID:     connID,
 		closeResChan: make(chan bool),
 	}
 	s.reqChan <- req

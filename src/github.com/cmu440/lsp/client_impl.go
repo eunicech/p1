@@ -16,29 +16,29 @@ type client struct {
 	epochLimit int
 	windowSize int
 	//maxUnackedMsgs   int
-	maxBackOff    int
-	epochSize     int
-	ticker        *time.Ticker
-	timer         *time.Time
-	clientID      int
-	conn          *lspnet.UDPConn
-	currSN        int      //keeps track of sequence numbers
-	serverSN      int      //keeps track of packets recieved
-	server_sn_res chan int // get what packet # we are waiting for
-	get_server_sn chan bool
-	client_sn_res chan int // get what packet # we are writing
-	get_client_sn chan bool
-	window        *slidingWindow
-	acks          chan Message
-	dataStorage   data
-	closeActivate chan bool
-	closed        bool
-	wroteInEpoch  bool
-	writtenChan   chan bool
-	signalEpoch   chan bool
-	unreadEpochs  int
-	readInEpoch   bool
-	readChan      chan bool
+	maxBackOff      int
+	epochSize       int
+	ticker          *time.Ticker
+	timer           *time.Time
+	clientID        int
+	conn            *lspnet.UDPConn
+	currSN          int      //keeps track of sequence numbers
+	serverSN        int      //keeps track of packets recieved
+	serverSeqNumRes chan int // get what packet # we are waiting for
+	getServerSN     chan bool
+	clientSeqNumRes chan int // get what packet # we are writing
+	getClientSN     chan bool
+	window          *slidingWindow
+	acks            chan Message
+	dataStorage     data
+	closeActivate   chan bool
+	closed          bool
+	wroteInEpoch    bool
+	writtenChan     chan bool
+	signalEpoch     chan bool
+	unreadEpochs    int
+	readInEpoch     bool
+	readChan        chan bool
 }
 
 type data struct {
@@ -106,21 +106,21 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		writtenChan: make(chan bool),
 		epochSize:   params.EpochMillis,
 		ticker:      time.NewTicker(time.Duration(1000000 * params.EpochMillis)),
-		//clientID:      ack_msg.ConnID,
-		conn:          udp,
-		currSN:        1,
-		serverSN:      1,
-		server_sn_res: make(chan int),
-		get_server_sn: make(chan bool),
-		client_sn_res: make(chan int),
-		get_client_sn: make(chan bool),
-		window:        window,
-		acks:          make(chan Message),
-		dataStorage:   dataStore,
-		closeActivate: make(chan bool),
-		closed:        false,
-		signalEpoch:   make(chan bool),
-		readChan:      make(chan bool),
+		//clientID:      ackMsg.ConnID,
+		conn:            udp,
+		currSN:          1,
+		serverSN:        1,
+		serverSeqNumRes: make(chan int),
+		getServerSN:     make(chan bool),
+		clientSeqNumRes: make(chan int),
+		getClientSN:     make(chan bool),
+		window:          window,
+		acks:            make(chan Message),
+		dataStorage:     dataStore,
+		closeActivate:   make(chan bool),
+		closed:          false,
+		signalEpoch:     make(chan bool),
+		readChan:        make(chan bool),
 	}
 
 	var epochsPassed int = 0
@@ -133,17 +133,17 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	}
 	udp.Write(msg)
 
-	ack_chan := make(chan Message)
-	err_chan := make(chan error)
-	var ack_msg Message
-	go readConnection(ack_chan, udp, err_chan)
+	ackChan := make(chan Message)
+	errChan := make(chan error)
+	var ackMsg Message
+	go readConnection(ackChan, udp, errChan)
 
 	var flag bool = false
 	for {
 		select {
 		case <-newClient.ticker.C:
-			epochsPassed += 1
-			totalEpochsPassed += 1
+			epochsPassed++
+			totalEpochsPassed++
 			if totalEpochsPassed > newClient.epochLimit {
 				flag = true
 				err = errors.New("timed out")
@@ -157,11 +157,11 @@ func NewClient(hostport string, params *Params) (Client, error) {
 					currentBackOff = currentBackOff * 2
 				}
 			}
-		case ack := <-ack_chan:
-			ack_msg = ack
+		case ack := <-ackChan:
+			ackMsg = ack
 			flag = true
 			break
-		case newErr := <-err_chan:
+		case newErr := <-errChan:
 			err = newErr
 			flag = true
 			break
@@ -174,7 +174,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	newClient.clientID = ack_msg.ConnID
+	newClient.clientID = ackMsg.ConnID
 	go newClient.clientInfoRequests()
 	go newClient.writeRoutine()
 	go newClient.readRoutine()
@@ -182,18 +182,18 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	return newClient, nil
 }
 
-func readConnection(ack_chan chan Message, udp *lspnet.UDPConn, err_chan chan error) {
+func readConnection(ackChan chan Message, udp *lspnet.UDPConn, errChan chan error) {
 	for {
-		var ack_msg Message
+		var ackMsg Message
 		var ack [2000]byte
 		bytesRead, err := udp.Read(ack[0:])
 		if err != nil {
-			err_chan <- err
+			errChan <- err
 			break
 		}
-		json.Unmarshal(ack[:bytesRead], &ack_msg)
-		if ack_msg.Type == MsgAck && ack_msg.SeqNum == 0 {
-			ack_chan <- ack_msg
+		json.Unmarshal(ack[:bytesRead], &ackMsg)
+		if ackMsg.Type == MsgAck && ackMsg.SeqNum == 0 {
+			ackChan <- ackMsg
 			break
 		}
 	}
@@ -203,21 +203,21 @@ func readConnection(ack_chan chan Message, udp *lspnet.UDPConn, err_chan chan er
 func (c *client) clientInfoRequests() {
 	for {
 		select {
-		case <-c.get_server_sn:
-			c.server_sn_res <- c.serverSN
-			c.serverSN += 1
-		case <-c.get_client_sn:
-			c.client_sn_res <- c.currSN
-			c.currSN += 1
+		case <-c.getServerSN:
+			c.serverSeqNumRes <- c.serverSN
+			c.serverSN++
+		case <-c.getClientSN:
+			c.clientSeqNumRes <- c.currSN
+			c.currSN++
 		case <-c.closeActivate:
 			c.closed = true
 			break
 		case <-c.ticker.C:
 			if !c.wroteInEpoch {
 				//send heartbeat
-				ack_msg := NewAck(c.clientID, 0)
-				byte_msg, _ := json.Marshal(&ack_msg)
-				c.conn.Write(byte_msg)
+				ackMsg := NewAck(c.clientID, 0)
+				byteMsg, _ := json.Marshal(&ackMsg)
+				c.conn.Write(byteMsg)
 				c.wroteInEpoch = false
 				c.signalEpoch <- true
 			}
@@ -243,25 +243,25 @@ func (c *client) ConnID() int {
 }
 
 func (c *client) readRequestsRoutine() {
-	var curr_req int
-	var curr_chan chan Message
+	var currReq int
+	var currChan chan Message
 	for {
 		select {
 		case req := <-c.dataStorage.readReqs:
 			//assumes another read request from client can't come until this one is fulfilled
-			curr_req = req.dataSN
-			curr_chan = req.dataRes
+			currReq = req.dataSN
+			currChan = req.dataRes
 		case packet := <-c.dataStorage.addData:
 			c.dataStorage.pendingData[packet.SeqNum] = packet
 		case <-c.dataStorage.closed:
 			break
 		}
-		value, exists := c.dataStorage.pendingData[curr_req]
+		value, exists := c.dataStorage.pendingData[currReq]
 		if exists {
 			//remove the value
-			delete(c.dataStorage.pendingData, curr_req)
+			delete(c.dataStorage.pendingData, currReq)
 			//add value to channel
-			curr_chan <- value
+			currChan <- value
 		}
 	}
 }
@@ -307,10 +307,10 @@ func (c *client) readRoutine() {
 }
 
 func (c *client) writeMsg(msg Message, ackChan chan Message, sigEpoch chan bool) {
-	byte_msg, _ := json.Marshal(&msg)
+	byteMsg, _ := json.Marshal(&msg)
 	var currentBackOff int = 0
 	var epochsPassed int = 0
-	c.conn.Write(byte_msg)
+	c.conn.Write(byteMsg)
 	select {
 	case c.writtenChan <- true:
 	default:
@@ -320,9 +320,9 @@ func (c *client) writeMsg(msg Message, ackChan chan Message, sigEpoch chan bool)
 		case <-ackChan:
 			break
 		case <-sigEpoch:
-			epochsPassed += 1
+			epochsPassed++
 			if epochsPassed > currentBackOff {
-				c.conn.Write(byte_msg)
+				c.conn.Write(byteMsg)
 				select {
 				case c.writtenChan <- true:
 				default:
@@ -346,8 +346,8 @@ func (c *client) writeRoutine() {
 			close(c.dataStorage.closed)
 			break
 		case payload := <-c.window.pendingMsgChan:
-			c.get_client_sn <- true
-			sn := <-c.client_sn_res
+			c.getClientSN <- true
+			sn := <-c.clientSeqNumRes
 			checksum := uint16(ByteArray2Checksum(payload))
 			dataMsg := NewData(c.clientID, sn, len(payload), payload, checksum)
 			ackChan := make(chan Message)
@@ -412,8 +412,8 @@ func (c *client) writeRoutine() {
 
 func (c *client) Read() ([]byte, error) {
 	//get number of data packet you need to read
-	c.get_server_sn <- true
-	sn := <-c.server_sn_res
+	c.getServerSN <- true
+	sn := <-c.serverSeqNumRes
 	result := make(chan Message)
 	//create read request
 	request := readReq{
