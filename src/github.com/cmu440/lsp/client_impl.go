@@ -132,7 +132,6 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		return nil, err
 	}
 	udp.Write(msg)
-
 	ackChan := make(chan Message)
 	errChan := make(chan error)
 	var ackMsg Message
@@ -213,13 +212,13 @@ func (c *client) clientInfoRequests() {
 			c.closed = true
 			break
 		case <-c.ticker.C:
+			c.signalEpoch <- true
 			if !c.wroteInEpoch {
 				//send heartbeat
 				ackMsg := NewAck(c.clientID, 0)
 				byteMsg, _ := json.Marshal(&ackMsg)
 				c.conn.Write(byteMsg)
 				c.wroteInEpoch = false
-				c.signalEpoch <- true
 			}
 
 			if !c.readInEpoch {
@@ -277,12 +276,11 @@ func (c *client) readRoutine() {
 			bytesRead, _ := c.conn.Read(packet[0:])
 			var data Message
 			json.Unmarshal(packet[:bytesRead], &data)
-
-			select {
-			case c.readChan <- true:
-			default:
-			}
-
+			// select {
+			// case c.readChan <- true:
+			// default:
+			// }
+			c.readChan <- true
 			//check if this an acknowledgement
 			if data.Type == MsgAck {
 				//ignore heartbeats
@@ -307,9 +305,11 @@ func (c *client) readRoutine() {
 }
 
 func (c *client) writeMsg(msg Message, ackChan chan Message, sigEpoch chan bool) {
+	// fmt.Printf("Trying to write %+v\n", msg)
 	byteMsg, _ := json.Marshal(&msg)
 	var currentBackOff int = 0
 	var epochsPassed int = 0
+	var flag bool = false
 	c.conn.Write(byteMsg)
 	select {
 	case c.writtenChan <- true:
@@ -318,6 +318,7 @@ func (c *client) writeMsg(msg Message, ackChan chan Message, sigEpoch chan bool)
 	for {
 		select {
 		case <-ackChan:
+			flag = true
 			break
 		case <-sigEpoch:
 			epochsPassed++
@@ -334,6 +335,9 @@ func (c *client) writeMsg(msg Message, ackChan chan Message, sigEpoch chan bool)
 					currentBackOff = currentBackOff * 2
 				}
 			}
+		}
+		if flag {
+			break
 		}
 	}
 }

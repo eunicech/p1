@@ -30,6 +30,7 @@ type server struct {
 	pendingAckList *list.List
 	hasPendingAck  chan *Message
 	ticker         *time.Ticker
+	writtenChan    chan int
 }
 
 type request struct {
@@ -64,6 +65,7 @@ type clientInfo struct {
 	toWrite        int
 	closeActivate  bool
 	slidingWin     *serverSlidingWindow
+	wroteInEpoch   bool
 }
 
 type serverSlidingWindow struct {
@@ -114,6 +116,7 @@ func NewServer(port int, params *Params) (Server, error) {
 		hasPendingAck:  make(chan *Message),
 		pendingAckList: list.New(),
 		ticker:         time.NewTicker(time.Duration(1000000 * params.EpochMillis)),
+		writtenChan:    make(chan int),
 	}
 
 	go newServer.readRoutine()
@@ -135,35 +138,41 @@ func (s *server) mapRequestHandler() {
 				s.conn.WriteToUDP(ack, client.addr)
 				s.clientMap[client.clientID] = client
 			case AddMsg:
+				// fmt.Printf("Adding message %+v\n", req.addMsg)
 				client := s.clientMap[req.clientID]
 				msg := req.addMsg
 				switch msg.Type {
 				case MsgAck:
 					ack := msg
 					client := s.clientMap[ack.ConnID]
-					for curr := client.slidingWin.pendingMsgs.Front(); curr != nil; curr = curr.Next() {
-						currElem := curr.Value.(*writeElem)
-						if currElem.sn == ack.SeqNum {
-							currElem.ackChan <- *ack
-							currElem.gotAck = true
+					//check if its a heartbeat
+					if ack.SeqNum == 0 {
+						//TODO: say we read from client
+					} else {
+						for curr := client.slidingWin.pendingMsgs.Front(); curr != nil; curr = curr.Next() {
+							currElem := curr.Value.(*writeElem)
+							if currElem.sn == ack.SeqNum {
+								currElem.ackChan <- *ack
+								currElem.gotAck = true
+							}
 						}
-					}
-					var keepRemoving bool = true
-					currElem := client.slidingWin.pendingMsgs.Front()
-					for keepRemoving && client.slidingWin.pendingMsgs.Len() > 0 {
-						wElem := currElem.Value.(*writeElem)
-						if wElem.gotAck {
-							client.slidingWin.pendingMsgs.Remove(currElem)
-							currElem = client.slidingWin.pendingMsgs.Front()
-						} else {
-							keepRemoving = false
+						var keepRemoving bool = true
+						currElem := client.slidingWin.pendingMsgs.Front()
+						for keepRemoving && client.slidingWin.pendingMsgs.Len() > 0 {
+							wElem := currElem.Value.(*writeElem)
+							if wElem.gotAck {
+								client.slidingWin.pendingMsgs.Remove(currElem)
+								currElem = client.slidingWin.pendingMsgs.Front()
+							} else {
+								keepRemoving = false
+							}
 						}
-					}
-					if client.slidingWin.pendingMsgs.Len() > 0 {
-						newElem := client.slidingWin.pendingMsgs.Front().Value.(*writeElem)
-						client.slidingWin.start = newElem.sn
-						//spawn new goroutines
-						go s.writeMsg(client.addr, *newElem.msg, newElem.ackChan, newElem.signalEpoch)
+						if client.slidingWin.pendingMsgs.Len() > 0 {
+							newElem := client.slidingWin.pendingMsgs.Front().Value.(*writeElem)
+							client.slidingWin.start = newElem.sn
+							//spawn new goroutines
+							go s.writeMsg(client.addr, *newElem.msg, newElem.ackChan, newElem.signalEpoch)
+						}
 					}
 
 				case MsgData:
@@ -234,6 +243,14 @@ func (s *server) mapRequestHandler() {
 			break
 		case <-s.ticker.C:
 			for _, v := range s.clientMap {
+				//check if we need to send a heartbeat
+				if !v.wroteInEpoch {
+					ackMsg := NewAck(v.clientID, 0)
+					byteMsg, _ := json.Marshal(&ackMsg)
+					s.conn.WriteToUDP(byteMsg, v.addr)
+				}
+				v.wroteInEpoch = false
+				//signal elements in sliding window
 				slidingWindow := v.slidingWin
 				count := 0
 				// for elem := slidingWindow.pendingMsgs.Front(); elem != nil && count < s.windowSize; elem = elem.Next() {
@@ -245,6 +262,9 @@ func (s *server) mapRequestHandler() {
 					count++
 				}
 			}
+		case clientNum := <-s.writtenChan:
+			client := s.clientMap[clientNum]
+			client.wroteInEpoch = true
 		}
 
 		if failedReqs > 0 {
@@ -274,6 +294,8 @@ func (s *server) mapRequestHandler() {
 func (s *server) writeMsg(addr *lspnet.UDPAddr, msg Message, ack chan Message, newSignalEpoch chan bool) {
 	byteMsg, _ := json.Marshal(&(msg))
 	s.conn.WriteToUDP(byteMsg, addr)
+	s.writtenChan <- msg.ConnID
+
 	var flag = false
 	var currentBackOff int = 0
 	var epochsPassed int = 0
@@ -285,6 +307,8 @@ func (s *server) writeMsg(addr *lspnet.UDPAddr, msg Message, ack chan Message, n
 			epochsPassed++
 			if epochsPassed > currentBackOff {
 				s.conn.WriteToUDP(byteMsg, addr)
+				s.writtenChan <- msg.ConnID
+
 				epochsPassed = 0
 				if currentBackOff != s.maxBackOff {
 					if currentBackOff == 0 {
@@ -313,8 +337,10 @@ func (s *server) readRoutine() {
 		default:
 			var packet [2000]byte
 			bytesRead, addr, _ := s.conn.ReadFromUDP(packet[0:])
+
 			var data Message
 			json.Unmarshal(packet[:bytesRead], &data)
+
 			//check if its a connection message
 			// fmt.Printf("Unmarshalled: %+v\n", data)
 			if data.Type == MsgConnect {
