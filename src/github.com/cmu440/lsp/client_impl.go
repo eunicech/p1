@@ -124,6 +124,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	}
 
 	var epochsPassed int = 0
+	var totalEpochsPassed int = 0
 	var currentBackOff int = 0
 	//send connection
 	msg, err := json.Marshal(NewConnect())
@@ -142,6 +143,11 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		select {
 		case <-newClient.ticker.C:
 			epochsPassed += 1
+			totalEpochsPassed += 1
+			if totalEpochsPassed > newClient.epochLimit {
+				flag = true
+				err = errors.New("timed out")
+			}
 			if epochsPassed > currentBackOff {
 				udp.Write(msg)
 				epochsPassed = 0
