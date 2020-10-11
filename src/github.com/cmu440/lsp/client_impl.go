@@ -107,7 +107,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		maxUnackedMsgs:  params.MaxUnackedMessages,
 		writtenChan:     make(chan bool),
 		epochSize:       params.EpochMillis,
-		ticker:          time.NewTicker(time.Duration(params.EpochMillis) * time.Millisecond),
+		ticker:          time.NewTicker(time.Duration(params.EpochMillis * 1000000)),
 		conn:            udp,
 		currSN:          1,
 		serverSN:        1,
@@ -175,7 +175,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		return nil, err
 	}
 	newClient.clientID = ackMsg.ConnID
-	fmt.Printf("epoch limit: %d,backoff: %d\n", newClient.epochLimit, newClient.maxBackOff)
+	// fmt.Printf("epoch limit: %d,backoff: %d\n", newClient.epochLimit, newClient.maxBackOff)
 	go newClient.clientInfoRequests()
 	go newClient.writeRoutine()
 	go newClient.readRoutine()
@@ -289,6 +289,8 @@ func (c *client) readRoutine() {
 			// case c.readChan <- true:
 			// default:
 			// }
+			// checksum(c.clientID, sn, len(payload), payload)
+
 			c.readChan <- true
 			//check if this an acknowledgement
 			if data.Type == MsgAck {
@@ -298,6 +300,15 @@ func (c *client) readRoutine() {
 				}
 			} else {
 				//data message
+				var payload []byte = data.Payload
+				if data.Size < len(data.Payload) {
+					payload = data.Payload[:data.Size]
+				}
+				chksum := c.checksum(data.ConnID, data.SeqNum, data.Size, payload)
+				if data.Size > len(data.Payload) || chksum != data.Checksum {
+					fmt.Println("Failed Checksum")
+					continue
+				}
 				ack, _ := json.Marshal(NewAck(c.clientID, data.SeqNum))
 				c.conn.Write(ack)
 				select {
@@ -368,8 +379,8 @@ func (c *client) writeRoutine() {
 		case payload := <-c.window.pendingMsgChan:
 			c.getClientSN <- true
 			sn := <-c.clientSeqNumRes
-			checksum := uint16(ByteArray2Checksum(payload))
-			dataMsg := NewData(c.clientID, sn, len(payload), payload, checksum)
+			chkSum := c.checksum(c.clientID, sn, len(payload), payload)
+			dataMsg := NewData(c.clientID, sn, len(payload), payload, chkSum)
 			ackChan := make(chan Message)
 			newSignalEpoch := make(chan bool)
 			newElem := &windowElem{
@@ -398,7 +409,7 @@ func (c *client) writeRoutine() {
 				count++
 			}
 		case ack := <-c.acks:
-			fmt.Printf("Got ack: %d\n", ack.SeqNum)
+			//fmt.Printf("Got ack: %d\n", ack.SeqNum)
 			//put ack in corresponding channel
 			sn := ack.SeqNum
 			for elem := c.window.pendingMsgs.Front(); elem != nil; elem = elem.Next() {
@@ -459,6 +470,35 @@ func (c *client) writeRoutine() {
 		}
 
 	}
+}
+
+func (c *client) checksum(connID int, seqNum int, size int, payload []byte) uint16 {
+	var sum uint32 = 0
+	MaxUint := ^uint32(0)
+	var half uint32 = MaxUint / 2
+	sum += Int2Checksum(connID)
+	if sum > half {
+		sum = sum % half
+		sum += 1
+	}
+	sum += Int2Checksum(seqNum)
+	if sum > half {
+		sum = sum % half
+		sum += 1
+	}
+	sum += Int2Checksum(size)
+	if sum > half {
+		sum = sum % half
+		sum += 1
+	}
+	sum += ByteArray2Checksum(payload)
+	if sum > half {
+		sum = sum % half
+		sum += 1
+	}
+	res := uint16(sum)
+
+	return ^res
 }
 
 func (c *client) Read() ([]byte, error) {

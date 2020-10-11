@@ -6,6 +6,7 @@ import (
 	"container/list"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -248,8 +249,8 @@ func (s *server) mapRequestHandler() {
 
 				// create msg
 				payload := req.data
-				checksum := uint16(ByteArray2Checksum(payload))
-				dataMsg := NewData(req.clientID, sn, len(payload), payload, checksum)
+				chksum := s.checksum(req.clientID, sn, len(payload), payload)
+				dataMsg := NewData(req.clientID, sn, len(payload), payload, chksum)
 
 				// add msg to pending msgs
 				ackChan := make(chan Message)
@@ -321,10 +322,7 @@ func (s *server) mapRequestHandler() {
 				delete(s.clientMap, clientID)
 			}
 		case clientNum := <-s.writtenChan:
-			client, ok := s.clientMap[clientNum]
-			if !ok {
-				continue
-			}
+			client := s.clientMap[clientNum]
 			client.wroteInEpoch = true
 		}
 
@@ -428,7 +426,15 @@ func (s *server) readRoutine() {
 			} else {
 				//check if data message and need to send ack
 				if data.Type == MsgData {
-					//TODO: verify checksum
+					var payload []byte = data.Payload
+					if data.Size < len(data.Payload) {
+						payload = data.Payload[:data.Size]
+					}
+					chksum := s.checksum(data.ConnID, data.SeqNum, data.Size, payload)
+					if data.Size > len(data.Payload) || chksum != data.Checksum {
+						fmt.Println("Server Failed Checksum")
+						continue
+					}
 					ack, _ := json.Marshal(NewAck(data.ConnID, data.SeqNum))
 					s.conn.WriteToUDP(ack, addr)
 				}
@@ -441,6 +447,35 @@ func (s *server) readRoutine() {
 			}
 		}
 	}
+}
+
+func (s *server) checksum(connID int, seqNum int, size int, payload []byte) uint16 {
+	var sum uint32 = 0
+	MaxUint := ^uint32(0)
+	var half uint32 = MaxUint / 2
+	sum += Int2Checksum(connID)
+	if sum > half {
+		sum = sum % half
+		sum += 1
+	}
+	sum += Int2Checksum(seqNum)
+	if sum > half {
+		sum = sum % half
+		sum += 1
+	}
+	sum += Int2Checksum(size)
+	if sum > half {
+		sum = sum % half
+		sum += 1
+	}
+	sum += ByteArray2Checksum(payload)
+	if sum > half {
+		sum = sum % half
+		sum += 1
+	}
+	res := uint16(sum)
+
+	return ^res
 }
 
 func (s *server) Read() (int, []byte, error) {
