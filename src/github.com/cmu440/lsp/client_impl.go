@@ -6,16 +6,16 @@ import (
 	"container/list"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/cmu440/lspnet"
 )
 
 type client struct {
-	//epoch          int
-	epochLimit int
-	windowSize int
-	//maxUnackedMsgs   int
+	epochLimit      int
+	windowSize      int
+	maxUnackedMsgs  int
 	maxBackOff      int
 	epochSize       int
 	ticker          *time.Ticker
@@ -57,6 +57,7 @@ type slidingWindow struct {
 	pendingMsgs    *list.List
 	pendingMsgChan chan []byte
 	start          int
+	numUnAcked     int
 }
 
 type windowElem struct {
@@ -97,16 +98,16 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		start:          1,
 		pendingMsgs:    list.New(),
 		pendingMsgChan: make(chan []byte),
+		numUnAcked:     0,
 	}
 	newClient := &client{
-		epochLimit: params.EpochLimit,
-		windowSize: params.WindowSize,
-		maxBackOff: params.MaxBackOffInterval,
-		//maxUnackedMsgs: params.MaxUnackedMessages,
-		writtenChan: make(chan bool),
-		epochSize:   params.EpochMillis,
-		ticker:      time.NewTicker(time.Duration(1000000 * params.EpochMillis)),
-		//clientID:      ackMsg.ConnID,
+		epochLimit:      params.EpochLimit,
+		windowSize:      params.WindowSize,
+		maxBackOff:      params.MaxBackOffInterval,
+		maxUnackedMsgs:  params.MaxUnackedMessages,
+		writtenChan:     make(chan bool),
+		epochSize:       params.EpochMillis,
+		ticker:          time.NewTicker(time.Duration(params.EpochMillis) * time.Millisecond),
 		conn:            udp,
 		currSN:          1,
 		serverSN:        1,
@@ -174,6 +175,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		return nil, err
 	}
 	newClient.clientID = ackMsg.ConnID
+	fmt.Printf("epoch limit: %d,backoff: %d\n", newClient.epochLimit, newClient.maxBackOff)
 	go newClient.clientInfoRequests()
 	go newClient.writeRoutine()
 	go newClient.readRoutine()
@@ -225,6 +227,7 @@ func (c *client) clientInfoRequests() {
 				// increment the number of epochs in which we haven't heard anything
 				c.unreadEpochs++
 				if c.unreadEpochs >= c.epochLimit {
+					c.conn.Close()
 					// TODO: drop the client/ connection
 				}
 			}
@@ -244,6 +247,7 @@ func (c *client) ConnID() int {
 func (c *client) readRequestsRoutine() {
 	var currReq int
 	var currChan chan Message
+	var flag bool = false
 	for {
 		select {
 		case req := <-c.dataStorage.readReqs:
@@ -251,8 +255,13 @@ func (c *client) readRequestsRoutine() {
 			currReq = req.dataSN
 			currChan = req.dataRes
 		case packet := <-c.dataStorage.addData:
+			//TODO: only add if it is >= current sn of server
 			c.dataStorage.pendingData[packet.SeqNum] = packet
 		case <-c.dataStorage.closed:
+			flag = true
+			break
+		}
+		if flag {
 			break
 		}
 		value, exists := c.dataStorage.pendingData[currReq]
@@ -297,7 +306,6 @@ func (c *client) readRoutine() {
 				}
 				c.dataStorage.addData <- data
 			}
-			//TODO: check if it is a heartbeat message
 
 		}
 	}
@@ -309,6 +317,7 @@ func (c *client) writeMsg(msg Message, ackChan chan Message, sigEpoch chan bool)
 	byteMsg, _ := json.Marshal(&msg)
 	var currentBackOff int = 0
 	var epochsPassed int = 0
+	var totalEpochs int = 0
 	var flag bool = false
 	c.conn.Write(byteMsg)
 	select {
@@ -322,6 +331,7 @@ func (c *client) writeMsg(msg Message, ackChan chan Message, sigEpoch chan bool)
 			break
 		case <-sigEpoch:
 			epochsPassed++
+			totalEpochs++
 			if epochsPassed > currentBackOff {
 				c.conn.Write(byteMsg)
 				select {
@@ -329,11 +339,17 @@ func (c *client) writeMsg(msg Message, ackChan chan Message, sigEpoch chan bool)
 				default:
 				}
 				epochsPassed = 0
-				if currentBackOff == 0 {
-					currentBackOff = 1
-				} else {
-					currentBackOff = currentBackOff * 2
+				if currentBackOff != c.maxBackOff {
+					if currentBackOff == 0 {
+						currentBackOff = 1
+					} else {
+						currentBackOff *= 2
+						if currentBackOff > c.maxBackOff {
+							currentBackOff = c.maxBackOff
+						}
+					}
 				}
+
 			}
 		}
 		if flag {
@@ -364,21 +380,25 @@ func (c *client) writeRoutine() {
 				signalEpoch: newSignalEpoch,
 			}
 			c.window.pendingMsgs.PushBack(newElem)
-			if c.window.pendingMsgs.Len() == 1 {
+			if c.window.pendingMsgs.Len() <= c.maxUnackedMsgs && newElem.sn < c.window.start+c.windowSize {
 				go c.writeMsg(*dataMsg, ackChan, newSignalEpoch)
+				c.window.numUnAcked++
 			}
 		case <-c.signalEpoch:
 			//signal epochs to all messages in window
 			count := 0
-			// for elem := c.window.pendingMsgs.Front(); elem != nil && count < c.windowSize; elem = elem.Next() {
-			for elem := c.window.pendingMsgs.Front(); elem != nil && count < 1; elem = elem.Next() {
+			for elem := c.window.pendingMsgs.Front(); elem != nil && count < c.window.start+c.maxUnackedMsgs; elem = elem.Next() {
 				currElem := elem.Value.(*windowElem)
+				if currElem.sn >= c.window.start+c.windowSize {
+					break
+				}
 				if !currElem.gotAck {
-					currElem.signalEpoch <- true
+					go func() { currElem.signalEpoch <- true }()
 				}
 				count++
 			}
 		case ack := <-c.acks:
+			fmt.Printf("Got ack: %d\n", ack.SeqNum)
 			//put ack in corresponding channel
 			sn := ack.SeqNum
 			for elem := c.window.pendingMsgs.Front(); elem != nil; elem = elem.Next() {
@@ -388,27 +408,54 @@ func (c *client) writeRoutine() {
 					currElem.gotAck = true
 				}
 			}
-			//remove messages that are good
-			var keepRemoving bool = true
+
+			//remove messages that are acknowledged
+			var count int = 0
+			var startFlag bool = true
+			var removedFromStart int = 0
 			currElem := c.window.pendingMsgs.Front()
-			for keepRemoving && c.window.pendingMsgs.Len() > 0 {
+			for count < c.windowSize && currElem != nil {
+				nextElem := currElem.Next()
 				wElem := currElem.Value.(*windowElem)
+				if wElem.sn >= c.window.start+c.windowSize {
+					break
+				}
 				if wElem.gotAck {
 					c.window.pendingMsgs.Remove(currElem)
-					currElem = c.window.pendingMsgs.Front()
+					c.window.numUnAcked--
+					if startFlag {
+						removedFromStart++
+					}
 				} else {
-					keepRemoving = false
+					startFlag = false
 				}
+				count++
+				currElem = nextElem
 			}
+			//update start of window
+			c.window.start += removedFromStart
 
-			// TODO: sliding window only one rn
 			//update window
-			if c.window.pendingMsgs.Len() > 0 {
-				newElem := c.window.pendingMsgs.Front().Value.(*windowElem)
-				c.window.start = newElem.sn
-				//spawn new goroutines
-				go c.writeMsg(*newElem.msg, newElem.ackChan, newElem.signalEpoch)
+			count = 0
+			var numStarted int = 0
+			currElem = c.window.pendingMsgs.Front()
+			for count < c.windowSize && currElem != nil {
+				wElem := currElem.Value.(*windowElem)
+				if count >= c.window.numUnAcked {
+					if c.window.numUnAcked+numStarted < c.maxUnackedMsgs {
+						if wElem.sn >= c.window.start+c.windowSize {
+							break
+						}
+						go c.writeMsg(*wElem.msg, wElem.ackChan, wElem.signalEpoch)
+						numStarted++
+					} else {
+						break
+					}
+				}
+				count++
 			}
+			c.window.numUnAcked += numStarted
+
 		}
 
 	}
