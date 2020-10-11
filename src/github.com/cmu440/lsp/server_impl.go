@@ -463,22 +463,22 @@ func (s *server) checksum(connID int, seqNum int, size int, payload []byte) uint
 	sum += Int2Checksum(connID)
 	if sum > half {
 		sum = sum % half
-		sum += 1
+		sum++
 	}
 	sum += Int2Checksum(seqNum)
 	if sum > half {
 		sum = sum % half
-		sum += 1
+		sum++
 	}
 	sum += Int2Checksum(size)
 	if sum > half {
 		sum = sum % half
-		sum += 1
+		sum++
 	}
 	sum += ByteArray2Checksum(payload)
 	if sum > half {
 		sum = sum % half
-		sum += 1
+		sum++
 	}
 	res := uint16(sum)
 

@@ -151,10 +151,15 @@ func NewClient(hostport string, params *Params) (Client, error) {
 			if epochsPassed > currentBackOff {
 				udp.Write(msg)
 				epochsPassed = 0
-				if currentBackOff == 0 {
-					currentBackOff = 1
-				} else {
-					currentBackOff = currentBackOff * 2
+				if currentBackOff != params.MaxBackOffInterval {
+					if currentBackOff == 0 {
+						currentBackOff = 1
+					} else {
+						currentBackOff = currentBackOff * 2
+						if currentBackOff > params.MaxBackOffInterval {
+							currentBackOff = params.MaxBackOffInterval
+						}
+					}
 				}
 			}
 		case ack := <-ackChan:
@@ -484,22 +489,22 @@ func (c *client) checksum(connID int, seqNum int, size int, payload []byte) uint
 	sum += Int2Checksum(connID)
 	if sum > half {
 		sum = sum % half
-		sum += 1
+		sum++
 	}
 	sum += Int2Checksum(seqNum)
 	if sum > half {
 		sum = sum % half
-		sum += 1
+		sum++
 	}
 	sum += Int2Checksum(size)
 	if sum > half {
 		sum = sum % half
-		sum += 1
+		sum++
 	}
 	sum += ByteArray2Checksum(payload)
 	if sum > half {
 		sum = sum % half
-		sum += 1
+		sum++
 	}
 	res := uint16(sum)
 
