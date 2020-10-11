@@ -145,10 +145,10 @@ func (s *server) mapRequestHandler() {
 				s.clientMap[client.clientID] = client
 			case AddMsg:
 				// fmt.Printf("Adding message %+v\n", req.addMsg)
-				client, ok := s.clientMap[req.clientID]
-				if !ok {
-					continue
-				}
+				client, _ := s.clientMap[req.clientID]
+				// if !ok {
+				// 	continue
+				// }
 				client.readInEpoch = true
 				msg := req.addMsg
 				switch msg.Type {
@@ -240,10 +240,10 @@ func (s *server) mapRequestHandler() {
 				}
 			case WriteMessage:
 				// get the current client sn and update it accordingly
-				client, ok := s.clientMap[req.clientID]
-				if !ok {
-					continue
-				}
+				client, _ := s.clientMap[req.clientID]
+				// if !ok {
+				// 	continue
+				// }
 				sn := client.currSN
 				client.currSN++
 
@@ -274,6 +274,7 @@ func (s *server) mapRequestHandler() {
 					req.closeResChan <- true
 				} else {
 					client.closeActivate = true
+					//TODO: why are we subtracting here...
 					client.toWrite--
 					if client.toWrite == 0 && client.closeActivate {
 						delete(s.clientMap, req.clientID)
@@ -304,7 +305,12 @@ func (s *server) mapRequestHandler() {
 						break
 					}
 					if !currElem.gotAck {
-						go func() { currElem.signalEpoch <- true }()
+						go func() {
+							select {
+							case currElem.signalEpoch <- true:
+							default:
+							}
+						}()
 					}
 					count++
 				}
@@ -369,7 +375,7 @@ func (s *server) writeMsg(addr *lspnet.UDPAddr, msg Message, ack chan Message, n
 				s.writtenChan <- msg.ConnID
 
 				epochsPassed = 0
-				if currentBackOff != s.maxBackOff {
+				if currentBackOff < s.maxBackOff {
 					if currentBackOff == 0 {
 						currentBackOff = 1
 					} else {
@@ -426,6 +432,7 @@ func (s *server) readRoutine() {
 			} else {
 				//check if data message and need to send ack
 				if data.Type == MsgData {
+					//verify checksum
 					var payload []byte = data.Payload
 					if data.Size < len(data.Payload) {
 						payload = data.Payload[:data.Size]
@@ -498,7 +505,6 @@ func (s *server) Write(connID int, payload []byte) error {
 	}
 
 	s.reqChan <- req
-
 	// s.pendingMsgChan <- *data
 
 	return nil

@@ -404,7 +404,12 @@ func (c *client) writeRoutine() {
 					break
 				}
 				if !currElem.gotAck {
-					go func() { currElem.signalEpoch <- true }()
+					go func() {
+						select {
+						case currElem.signalEpoch <- true:
+						default:
+						}
+					}()
 				}
 				count++
 			}
