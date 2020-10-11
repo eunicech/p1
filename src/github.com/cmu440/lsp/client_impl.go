@@ -6,37 +6,43 @@ import (
 	"container/list"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/cmu440/lspnet"
 )
 
 type client struct {
 	//epoch          int
-	//epochLimit       int
-	//windowSize       int
+	epochLimit int
+	windowSize int
 	//maxUnackedMsgs   int
-	//backOff          int
-	//maxBackOff       int
-	//timer            *time.Ticker
-	clientID      int
-	conn          *lspnet.UDPConn
-	currSN        int      //keeps track of sequence numbers
-	serverSN      int      //keeps track of packets recieved
-	server_sn_res chan int // get what packet # we are waiting for
-	get_server_sn chan bool
-	client_sn_res chan int // get what packet # we are writing
-	get_client_sn chan bool
-	pendingMsgs   *list.List
-	// pendingMsgChan chan *Message
-	pendingMsgChan chan []byte
-	acks           chan Message
-	dataStorage    data
-	closeActivate  chan bool
-	closed         bool
+	maxBackOff      int
+	epochSize       int
+	ticker          *time.Ticker
+	timer           *time.Time
+	clientID        int
+	conn            *lspnet.UDPConn
+	currSN          int      //keeps track of sequence numbers
+	serverSN        int      //keeps track of packets recieved
+	serverSeqNumRes chan int // get what packet # we are waiting for
+	getServerSN     chan bool
+	clientSeqNumRes chan int // get what packet # we are writing
+	getClientSN     chan bool
+	window          *slidingWindow
+	acks            chan Message
+	dataStorage     data
+	closeActivate   chan bool
+	closed          bool
+	wroteInEpoch    bool
+	writtenChan     chan bool
+	signalEpoch     chan bool
+	unreadEpochs    int
+	readInEpoch     bool
+	readChan        chan bool
 }
 
 type data struct {
-	read_reqs   chan readReq
+	readReqs    chan readReq
 	pendingData map[int]Message
 	addData     chan Message
 	closed      chan bool
@@ -45,6 +51,20 @@ type data struct {
 type readReq struct {
 	dataSN  int
 	dataRes chan Message
+}
+
+type slidingWindow struct {
+	pendingMsgs    *list.List
+	pendingMsgChan chan []byte
+	start          int
+}
+
+type windowElem struct {
+	sn          int
+	ackChan     chan Message
+	signalEpoch chan bool
+	msg         *Message
+	gotAck      bool
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -67,72 +87,152 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		return nil, err
 	}
 
+	dataStore := data{
+		readReqs:    make(chan readReq),
+		pendingData: make(map[int]Message),
+		addData:     make(chan Message),
+		closed:      make(chan bool),
+	}
+	window := &slidingWindow{
+		start:          1,
+		pendingMsgs:    list.New(),
+		pendingMsgChan: make(chan []byte),
+	}
+	newClient := &client{
+		epochLimit: params.EpochLimit,
+		windowSize: params.WindowSize,
+		maxBackOff: params.MaxBackOffInterval,
+		//maxUnackedMsgs: params.MaxUnackedMessages,
+		writtenChan: make(chan bool),
+		epochSize:   params.EpochMillis,
+		ticker:      time.NewTicker(time.Duration(1000000 * params.EpochMillis)),
+		//clientID:      ackMsg.ConnID,
+		conn:            udp,
+		currSN:          1,
+		serverSN:        1,
+		serverSeqNumRes: make(chan int),
+		getServerSN:     make(chan bool),
+		clientSeqNumRes: make(chan int),
+		getClientSN:     make(chan bool),
+		window:          window,
+		acks:            make(chan Message),
+		dataStorage:     dataStore,
+		closeActivate:   make(chan bool),
+		closed:          false,
+		signalEpoch:     make(chan bool),
+		readChan:        make(chan bool),
+	}
+
+	var epochsPassed int = 0
+	var totalEpochsPassed int = 0
+	var currentBackOff int = 0
 	//send connection
 	msg, err := json.Marshal(NewConnect())
 	if err != nil {
 		return nil, err
 	}
-
 	udp.Write(msg)
-	// wait for acknowledgement
-	var ack_msg Message
-	var ack [2000]byte
-	bytesRead, err := udp.Read(ack[0:])
+	ackChan := make(chan Message)
+	errChan := make(chan error)
+	var ackMsg Message
+	go readConnection(ackChan, udp, errChan)
+
+	var flag bool = false
+	for {
+		select {
+		case <-newClient.ticker.C:
+			epochsPassed++
+			totalEpochsPassed++
+			if totalEpochsPassed > newClient.epochLimit {
+				flag = true
+				err = errors.New("timed out")
+			}
+			if epochsPassed > currentBackOff {
+				udp.Write(msg)
+				epochsPassed = 0
+				if currentBackOff == 0 {
+					currentBackOff = 1
+				} else {
+					currentBackOff = currentBackOff * 2
+				}
+			}
+		case ack := <-ackChan:
+			ackMsg = ack
+			flag = true
+			break
+		case newErr := <-errChan:
+			err = newErr
+			flag = true
+			break
+		}
+		if flag {
+			break
+		}
+
+	}
 	if err != nil {
 		return nil, err
 	}
-	json.Unmarshal(ack[:bytesRead], &ack_msg)
-	if ack_msg.Type != MsgAck || ack_msg.SeqNum != 0 {
-		return nil, errors.New("Not an acknowledgement")
+	newClient.clientID = ackMsg.ConnID
+	go newClient.clientInfoRequests()
+	go newClient.writeRoutine()
+	go newClient.readRoutine()
+	go newClient.readRequestsRoutine()
+	return newClient, nil
+}
+
+func readConnection(ackChan chan Message, udp *lspnet.UDPConn, errChan chan error) {
+	for {
+		var ackMsg Message
+		var ack [2000]byte
+		bytesRead, err := udp.Read(ack[0:])
+		if err != nil {
+			errChan <- err
+			break
+		}
+		json.Unmarshal(ack[:bytesRead], &ackMsg)
+		if ackMsg.Type == MsgAck && ackMsg.SeqNum == 0 {
+			ackChan <- ackMsg
+			break
+		}
 	}
 
-	dataStore := data{
-		read_reqs:   make(chan readReq),
-		pendingData: make(map[int]Message),
-		addData:     make(chan Message),
-		closed:      make(chan bool),
-	}
-
-	new_client := &client{
-		//epochLimit:     params.EpochLimit,
-		//windowSize:     params.WindowSize,
-		//maxBackOff:     params.MaxBackOffInterval,
-		//maxUnackedMsgs: params.MaxUnackedMessages,
-		//timer:          time.NewTicker(time.Duration(1000000 * params.EpochMillis)),
-		clientID:      ack_msg.ConnID,
-		conn:          udp,
-		currSN:        1,
-		serverSN:      1,
-		server_sn_res: make(chan int),
-		get_server_sn: make(chan bool),
-		client_sn_res: make(chan int),
-		get_client_sn: make(chan bool),
-		//pendingMsgs:    list.New(),
-		pendingMsgChan: make(chan []byte),
-		acks:           make(chan Message),
-		dataStorage:    dataStore,
-		closeActivate:  make(chan bool),
-		closed:         false,
-	}
-	go new_client.clientInfoRequests()
-	go new_client.writeRoutine()
-	go new_client.readRoutine()
-	go new_client.readRequestsRoutine()
-	return new_client, nil
 }
 
 func (c *client) clientInfoRequests() {
 	for {
 		select {
-		case <-c.get_server_sn:
-			c.server_sn_res <- c.serverSN
-			c.serverSN += 1
-		case <-c.get_client_sn:
-			c.client_sn_res <- c.currSN
-			c.currSN += 1
+		case <-c.getServerSN:
+			c.serverSeqNumRes <- c.serverSN
+			c.serverSN++
+		case <-c.getClientSN:
+			c.clientSeqNumRes <- c.currSN
+			c.currSN++
 		case <-c.closeActivate:
 			c.closed = true
 			break
+		case <-c.ticker.C:
+			c.signalEpoch <- true
+			if !c.wroteInEpoch {
+				//send heartbeat
+				ackMsg := NewAck(c.clientID, 0)
+				byteMsg, _ := json.Marshal(&ackMsg)
+				c.conn.Write(byteMsg)
+				c.wroteInEpoch = false
+			}
+
+			if !c.readInEpoch {
+				// increment the number of epochs in which we haven't heard anything
+				c.unreadEpochs++
+				if c.unreadEpochs >= c.epochLimit {
+					// TODO: drop the client/ connection
+				}
+			}
+		case <-c.writtenChan:
+			c.wroteInEpoch = true
+		case <-c.readChan:
+			c.readInEpoch = true
+			c.unreadEpochs = 0
 		}
 	}
 }
@@ -142,26 +242,25 @@ func (c *client) ConnID() int {
 }
 
 func (c *client) readRequestsRoutine() {
-	var curr_req int
-	var curr_chan chan Message
+	var currReq int
+	var currChan chan Message
 	for {
 		select {
-		case req := <-c.dataStorage.read_reqs:
+		case req := <-c.dataStorage.readReqs:
 			//assumes another read request from client can't come until this one is fulfilled
-			curr_req = req.dataSN
-			curr_chan = req.dataRes
+			currReq = req.dataSN
+			currChan = req.dataRes
 		case packet := <-c.dataStorage.addData:
 			c.dataStorage.pendingData[packet.SeqNum] = packet
 		case <-c.dataStorage.closed:
 			break
-
 		}
-		value, exists := c.dataStorage.pendingData[curr_req]
+		value, exists := c.dataStorage.pendingData[currReq]
 		if exists {
 			//remove the value
-			delete(c.dataStorage.pendingData, curr_req)
+			delete(c.dataStorage.pendingData, currReq)
 			//add value to channel
-			curr_chan <- value
+			currChan <- value
 		}
 	}
 }
@@ -177,7 +276,11 @@ func (c *client) readRoutine() {
 			bytesRead, _ := c.conn.Read(packet[0:])
 			var data Message
 			json.Unmarshal(packet[:bytesRead], &data)
-
+			// select {
+			// case c.readChan <- true:
+			// default:
+			// }
+			c.readChan <- true
 			//check if this an acknowledgement
 			if data.Type == MsgAck {
 				//ignore heartbeats
@@ -188,6 +291,10 @@ func (c *client) readRoutine() {
 				//data message
 				ack, _ := json.Marshal(NewAck(c.clientID, data.SeqNum))
 				c.conn.Write(ack)
+				select {
+				case c.writtenChan <- true:
+				default:
+				}
 				c.dataStorage.addData <- data
 			}
 			//TODO: check if it is a heartbeat message
@@ -197,11 +304,42 @@ func (c *client) readRoutine() {
 
 }
 
-func (c *client) writeMsg(msg Message ) {
-	byte_msg, _ := json.Marshal(&msg)
-	c.conn.Write(byte_msg)
-	//wait for acknowledgement
-	<-c.acks
+func (c *client) writeMsg(msg Message, ackChan chan Message, sigEpoch chan bool) {
+	// fmt.Printf("Trying to write %+v\n", msg)
+	byteMsg, _ := json.Marshal(&msg)
+	var currentBackOff int = 0
+	var epochsPassed int = 0
+	var flag bool = false
+	c.conn.Write(byteMsg)
+	select {
+	case c.writtenChan <- true:
+	default:
+	}
+	for {
+		select {
+		case <-ackChan:
+			flag = true
+			break
+		case <-sigEpoch:
+			epochsPassed++
+			if epochsPassed > currentBackOff {
+				c.conn.Write(byteMsg)
+				select {
+				case c.writtenChan <- true:
+				default:
+				}
+				epochsPassed = 0
+				if currentBackOff == 0 {
+					currentBackOff = 1
+				} else {
+					currentBackOff = currentBackOff * 2
+				}
+			}
+		}
+		if flag {
+			break
+		}
+	}
 }
 
 func (c *client) writeRoutine() {
@@ -211,22 +349,66 @@ func (c *client) writeRoutine() {
 		case <-c.closeActivate:
 			close(c.dataStorage.closed)
 			break
-		case payload := <-c.pendingMsgChan:
-			//create dataMsg
-			c.get_client_sn <- true
-			sn := <-c.client_sn_res
+		case payload := <-c.window.pendingMsgChan:
+			c.getClientSN <- true
+			sn := <-c.clientSeqNumRes
 			checksum := uint16(ByteArray2Checksum(payload))
 			dataMsg := NewData(c.clientID, sn, len(payload), payload, checksum)
-			c.pendingMsgs.PushBack(dataMsg)
-			//go c.writeMsg(*dataMsg)
-		case ack := <- c.acks
-			
-			//put ack in corresponding thing
-			//check 1st 
-			//if first is good -> loop through
-			//update sliding window
-			//spawn any new goroutines
+			ackChan := make(chan Message)
+			newSignalEpoch := make(chan bool)
+			newElem := &windowElem{
+				sn:          sn,
+				msg:         dataMsg,
+				ackChan:     ackChan,
+				gotAck:      false,
+				signalEpoch: newSignalEpoch,
+			}
+			c.window.pendingMsgs.PushBack(newElem)
+			if c.window.pendingMsgs.Len() == 1 {
+				go c.writeMsg(*dataMsg, ackChan, newSignalEpoch)
+			}
+		case <-c.signalEpoch:
+			//signal epochs to all messages in window
+			count := 0
+			// for elem := c.window.pendingMsgs.Front(); elem != nil && count < c.windowSize; elem = elem.Next() {
+			for elem := c.window.pendingMsgs.Front(); elem != nil && count < 1; elem = elem.Next() {
+				currElem := elem.Value.(*windowElem)
+				if !currElem.gotAck {
+					currElem.signalEpoch <- true
+				}
+				count++
+			}
+		case ack := <-c.acks:
+			//put ack in corresponding channel
+			sn := ack.SeqNum
+			for elem := c.window.pendingMsgs.Front(); elem != nil; elem = elem.Next() {
+				currElem := elem.Value.(*windowElem)
+				if currElem.sn == sn {
+					currElem.ackChan <- ack
+					currElem.gotAck = true
+				}
+			}
+			//remove messages that are good
+			var keepRemoving bool = true
+			currElem := c.window.pendingMsgs.Front()
+			for keepRemoving && c.window.pendingMsgs.Len() > 0 {
+				wElem := currElem.Value.(*windowElem)
+				if wElem.gotAck {
+					c.window.pendingMsgs.Remove(currElem)
+					currElem = c.window.pendingMsgs.Front()
+				} else {
+					keepRemoving = false
+				}
+			}
 
+			// TODO: sliding window only one rn
+			//update window
+			if c.window.pendingMsgs.Len() > 0 {
+				newElem := c.window.pendingMsgs.Front().Value.(*windowElem)
+				c.window.start = newElem.sn
+				//spawn new goroutines
+				go c.writeMsg(*newElem.msg, newElem.ackChan, newElem.signalEpoch)
+			}
 		}
 
 	}
@@ -234,15 +416,15 @@ func (c *client) writeRoutine() {
 
 func (c *client) Read() ([]byte, error) {
 	//get number of data packet you need to read
-	c.get_server_sn <- true
-	sn := <-c.server_sn_res
+	c.getServerSN <- true
+	sn := <-c.serverSeqNumRes
 	result := make(chan Message)
 	//create read request
 	request := readReq{
 		dataSN:  sn,
 		dataRes: result,
 	}
-	c.dataStorage.read_reqs <- request
+	c.dataStorage.readReqs <- request
 	//wait for data
 	data := <-request.dataRes
 
@@ -250,7 +432,7 @@ func (c *client) Read() ([]byte, error) {
 }
 
 func (c *client) Write(payload []byte) error {
-	c.pendingMsgChan <- payload
+	c.window.pendingMsgChan <- payload
 	return nil
 }
 
