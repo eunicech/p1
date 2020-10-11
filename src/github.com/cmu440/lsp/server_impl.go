@@ -16,6 +16,7 @@ type server struct {
 	epochLimit     int
 	windowSize     int
 	maxBackOff     int
+	maxUnackedMsgs int
 	clientMap      map[int]*clientInfo
 	clientNum      int
 	conn           *lspnet.UDPConn
@@ -66,11 +67,14 @@ type clientInfo struct {
 	closeActivate  bool
 	slidingWin     *serverSlidingWindow
 	wroteInEpoch   bool
+	readInEpoch    bool
+	unreadEpochs   int
 }
 
 type serverSlidingWindow struct {
 	pendingMsgs *list.List
 	start       int
+	numUnAcked  int
 }
 
 type writeElem struct {
@@ -103,6 +107,7 @@ func NewServer(port int, params *Params) (Server, error) {
 		epochLimit:     params.EpochLimit,
 		windowSize:     params.WindowSize,
 		maxBackOff:     params.MaxBackOffInterval,
+		maxUnackedMsgs: params.MaxUnackedMessages,
 		clientMap:      make(map[int]*clientInfo),
 		clientNum:      1,
 		conn:           udpconn,
@@ -139,7 +144,11 @@ func (s *server) mapRequestHandler() {
 				s.clientMap[client.clientID] = client
 			case AddMsg:
 				// fmt.Printf("Adding message %+v\n", req.addMsg)
-				client := s.clientMap[req.clientID]
+				client, ok := s.clientMap[req.clientID]
+				if !ok {
+					continue
+				}
+				client.readInEpoch = true
 				msg := req.addMsg
 				switch msg.Type {
 				case MsgAck:
@@ -149,6 +158,7 @@ func (s *server) mapRequestHandler() {
 					if ack.SeqNum == 0 {
 						//TODO: say we read from client
 					} else {
+						//add acknowledgement
 						for curr := client.slidingWin.pendingMsgs.Front(); curr != nil; curr = curr.Next() {
 							currElem := curr.Value.(*writeElem)
 							if currElem.sn == ack.SeqNum {
@@ -156,23 +166,52 @@ func (s *server) mapRequestHandler() {
 								currElem.gotAck = true
 							}
 						}
-						var keepRemoving bool = true
+						//remove messages that are acknowledged
+						var count int = 0
+						var startFlag bool = true
+						var removedFromStart int = 0
 						currElem := client.slidingWin.pendingMsgs.Front()
-						for keepRemoving && client.slidingWin.pendingMsgs.Len() > 0 {
+						for count < s.windowSize && currElem != nil {
+							nextElem := currElem.Next()
 							wElem := currElem.Value.(*writeElem)
+							if wElem.sn >= client.slidingWin.start+s.windowSize {
+								break
+							}
 							if wElem.gotAck {
 								client.slidingWin.pendingMsgs.Remove(currElem)
-								currElem = client.slidingWin.pendingMsgs.Front()
+								client.slidingWin.numUnAcked--
+								if startFlag {
+									removedFromStart++
+								}
 							} else {
-								keepRemoving = false
+								startFlag = false
 							}
+							count++
+							currElem = nextElem
 						}
-						if client.slidingWin.pendingMsgs.Len() > 0 {
-							newElem := client.slidingWin.pendingMsgs.Front().Value.(*writeElem)
-							client.slidingWin.start = newElem.sn
-							//spawn new goroutines
-							go s.writeMsg(client.addr, *newElem.msg, newElem.ackChan, newElem.signalEpoch)
+						//update start of window
+						client.slidingWin.start += removedFromStart
+
+						//spawn new goroutines
+						count = 0
+						var numStarted int = 0
+						currElem = client.slidingWin.pendingMsgs.Front()
+						for count < s.windowSize && currElem != nil {
+							wElem := currElem.Value.(*writeElem)
+							if count >= client.slidingWin.numUnAcked {
+								if client.slidingWin.numUnAcked+numStarted < s.maxUnackedMsgs {
+									if wElem.sn >= client.slidingWin.start+s.windowSize {
+										break
+									}
+									go s.writeMsg(client.addr, *wElem.msg, wElem.ackChan, wElem.signalEpoch)
+									numStarted++
+								} else {
+									break
+								}
+							}
+							count++
 						}
+						client.slidingWin.numUnAcked += numStarted
 					}
 
 				case MsgData:
@@ -200,7 +239,10 @@ func (s *server) mapRequestHandler() {
 				}
 			case WriteMessage:
 				// get the current client sn and update it accordingly
-				client := s.clientMap[req.clientID]
+				client, ok := s.clientMap[req.clientID]
+				if !ok {
+					continue
+				}
 				sn := client.currSN
 				client.currSN++
 
@@ -221,8 +263,9 @@ func (s *server) mapRequestHandler() {
 				}
 
 				client.slidingWin.pendingMsgs.PushBack(newElem)
-				if client.slidingWin.pendingMsgs.Len() == 1 {
+				if client.slidingWin.pendingMsgs.Len() <= s.maxUnackedMsgs && newElem.sn < client.slidingWin.start+s.windowSize {
 					go s.writeMsg(client.addr, *dataMsg, ackChan, newSignalEpoch)
+					client.slidingWin.numUnAcked++
 				}
 			case CloseCxn:
 				client, ok := s.clientMap[req.clientID]
@@ -242,7 +285,8 @@ func (s *server) mapRequestHandler() {
 			//TODO signal the close
 			break
 		case <-s.ticker.C:
-			for _, v := range s.clientMap {
+			var toDelete []int
+			for k, v := range s.clientMap {
 				//check if we need to send a heartbeat
 				if !v.wroteInEpoch {
 					ackMsg := NewAck(v.clientID, 0)
@@ -253,17 +297,34 @@ func (s *server) mapRequestHandler() {
 				//signal elements in sliding window
 				slidingWindow := v.slidingWin
 				count := 0
-				// for elem := slidingWindow.pendingMsgs.Front(); elem != nil && count < s.windowSize; elem = elem.Next() {
-				for elem := slidingWindow.pendingMsgs.Front(); elem != nil && count < 1; elem = elem.Next() {
+				for elem := slidingWindow.pendingMsgs.Front(); elem != nil && count < slidingWindow.start+s.maxUnackedMsgs; elem = elem.Next() {
 					currElem := elem.Value.(*writeElem)
+					if currElem.sn >= slidingWindow.start+s.windowSize {
+						break
+					}
 					if !currElem.gotAck {
-						currElem.signalEpoch <- true
+						go func() { currElem.signalEpoch <- true }()
 					}
 					count++
 				}
+
+				if !v.readInEpoch {
+					v.unreadEpochs++
+					if v.unreadEpochs >= s.epochLimit {
+						// delete it from the map somehow
+						toDelete = append(toDelete, k)
+					}
+				}
+			}
+
+			for _, clientID := range toDelete {
+				delete(s.clientMap, clientID)
 			}
 		case clientNum := <-s.writtenChan:
-			client := s.clientMap[clientNum]
+			client, ok := s.clientMap[clientNum]
+			if !ok {
+				continue
+			}
 			client.wroteInEpoch = true
 		}
 
@@ -314,8 +375,8 @@ func (s *server) writeMsg(addr *lspnet.UDPAddr, msg Message, ack chan Message, n
 					if currentBackOff == 0 {
 						currentBackOff = 1
 					} else {
-						currentBackOff = currentBackOff * 2
-						if currentBackOff >= s.maxBackOff {
+						currentBackOff *= 2
+						if currentBackOff > s.maxBackOff {
 							currentBackOff = s.maxBackOff
 						}
 					}
