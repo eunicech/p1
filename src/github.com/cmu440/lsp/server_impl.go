@@ -145,7 +145,7 @@ func NewServer(port int, params *Params) (Server, error) {
 func (s *server) mapRequestHandler() {
 	var failedReqs int = 0
 	var needToClose bool = false
-	var flag bool = false
+	//var flag bool = false
 	for {
 		select {
 		case req := <-s.reqChan:
@@ -237,8 +237,10 @@ func (s *server) mapRequestHandler() {
 							} else if needToClose {
 								delete(s.clientMap, client.clientID)
 								if len(s.clientMap) == 0 {
-									flag = true
-									break
+									// flag = true
+									// break
+									close(s.readingClose)
+									return
 								}
 							}
 						}
@@ -359,14 +361,16 @@ func (s *server) mapRequestHandler() {
 				}
 				// fmt.Printf("# of clients %d\n", len(s.clientMap))
 				if len(s.clientMap) == 0 {
-					flag = true
-					break
+					// flag = true
+					// break
+					close(s.readingClose)
+					return
+
 				}
 				needToClose = true
 			}
-			break
+			//break
 		case <-s.ticker.C:
-			//start := time.Now()
 			var toDelete []int
 			for k, v := range s.clientMap {
 				//check if we need to send a heartbeat
@@ -378,7 +382,6 @@ func (s *server) mapRequestHandler() {
 				v.wroteInEpoch = false
 				//check if the connection is lost
 				if v.lost {
-					// fmt.Printf("added: %d\n", v.clientID)
 					toDelete = append(toDelete, v.clientID)
 				} else {
 					if !v.readInEpoch {
@@ -414,14 +417,16 @@ func (s *server) mapRequestHandler() {
 				}
 
 			}
+			// fmt.Printf("LEN: %d\n", s.clientErr.Len())
+			// fmt.Println(time.Now())
 		case clientNum := <-s.writtenChan:
 			client := s.clientMap[clientNum]
 			client.wroteInEpoch = true
 		}
-		if flag {
-			close(s.readingClose)
-			break
-		}
+		// if flag {
+		// 	close(s.readingClose)
+		// 	break
+		// }
 		if failedReqs > 0 {
 			var cr *clientInfo
 			var found bool = false
@@ -433,11 +438,6 @@ func (s *server) mapRequestHandler() {
 					break
 				}
 			}
-			// if flag {
-			// 	//tell read routine to stop reading
-			// 	close(s.readingClose)
-			// 	break
-			// }
 			if found {
 				res := cr.storedMessages[cr.clientSN]
 				delete(cr.storedMessages, cr.clientSN)
@@ -457,6 +457,9 @@ func (s *server) mapRequestHandler() {
 				s.readRes <- res
 				failedReqs--
 			}
+			// } else {
+			// 	fmt.Printf("reqs: %v\n", time.Now())
+			// }
 		}
 	}
 }
@@ -465,13 +468,14 @@ func (s *server) writeMsg(addr *lspnet.UDPAddr, msg Message, ack chan Message, t
 	byteMsg, _ := json.Marshal(&(msg))
 	s.conn.WriteToUDP(byteMsg, addr)
 
-	var flag = false
+	//var flag = false
 	var currentBackOff int = 0
 	var epochsPassed int = 0
 	for {
 		select {
 		case <-ack:
-			flag = true
+			// flag = true
+			return
 		case <-ticker.C:
 			epochsPassed++
 			if epochsPassed > currentBackOff {
@@ -491,22 +495,24 @@ func (s *server) writeMsg(addr *lspnet.UDPAddr, msg Message, ack chan Message, t
 				}
 			}
 		case <-cxnClosed:
-			flag = true
+			// flag = true
+			return
 		}
-		if flag {
-			break
-		}
+		// if flag {
+		// 	break
+		// }
 	}
 }
 
 func (s *server) readRoutine() {
-	var flag bool = false
+	//var flag bool = false
 	go s.mapRequestHandler()
 	for {
 		select {
 		case <-s.readingClose:
-			flag = true
-			break
+			// flag = true
+			// break
+			return
 		default:
 			var packet [2000]byte
 			bytesRead, addr, _ := s.conn.ReadFromUDP(packet[0:])
@@ -515,7 +521,6 @@ func (s *server) readRoutine() {
 			json.Unmarshal(packet[:bytesRead], &data)
 
 			//check if its a connection message
-			// fmt.Printf("Unmarshalled: %+v\n", data)
 			if data.Type == MsgConnect {
 				newWindow := &serverSlidingWindow{
 					start:       1,
@@ -548,6 +553,7 @@ func (s *server) readRoutine() {
 					if data.Size > len(data.Payload) || chksum != data.Checksum {
 						continue
 					}
+					//send ack
 					ack, _ := json.Marshal(NewAck(data.ConnID, data.SeqNum))
 					s.conn.WriteToUDP(ack, addr)
 				}
@@ -559,9 +565,9 @@ func (s *server) readRoutine() {
 				s.reqChan <- req
 			}
 		}
-		if flag {
-			break
-		}
+		// if flag {
+		// 	break
+		// }
 	}
 }
 
@@ -637,5 +643,6 @@ func (s *server) Close() error {
 	}
 	close(s.closeActivate)
 	<-s.readingClose
+	s.conn.Close()
 	return nil
 }

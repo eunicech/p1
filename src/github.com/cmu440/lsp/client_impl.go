@@ -6,6 +6,7 @@ import (
 	"container/list"
 	"encoding/json"
 	"errors"
+	"io"
 	"time"
 
 	"github.com/cmu440/lspnet"
@@ -186,7 +187,6 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		return nil, err
 	}
 	newClient.clientID = ackMsg.ConnID
-	// fmt.Printf("epoch limit: %d,backoff: %d\n", newClient.epochLimit, newClient.maxBackOff)
 	go newClient.clientInfoRequests()
 	go newClient.writeRoutine()
 	go newClient.readRoutine()
@@ -209,7 +209,7 @@ func readConnection(ackChan chan Message, udp *lspnet.UDPConn) {
 }
 
 func (c *client) clientInfoRequests() {
-	var flag bool = false
+	// var flag bool = false
 	for {
 		select {
 		case <-c.getServerSN:
@@ -219,11 +219,13 @@ func (c *client) clientInfoRequests() {
 			c.clientSeqNumRes <- c.currSN
 			c.currSN++
 		case <-c.dataStorage.closed:
-			flag = true
-			break
+			// flag = true
+			// break
+			return
 		case <-c.closeInfoReq:
-			flag = true
-			break
+			// flag = true
+			// break
+			return
 		case <-c.ticker.C:
 			// c.signalEpoch <- true
 			if !c.wroteInEpoch {
@@ -253,9 +255,9 @@ func (c *client) clientInfoRequests() {
 			c.readInEpoch = true
 			//c.unreadEpochs = 0
 		}
-		if flag {
-			break
-		}
+		// if flag {
+		// 	break
+		// }
 	}
 }
 
@@ -268,7 +270,7 @@ func (c *client) readRequestsRoutine() {
 	var currChan chan Message
 	var errChan chan error
 	var completedReq bool = true
-	var flag bool = false
+	// var flag bool = false
 	for {
 		select {
 		case req := <-c.dataStorage.readReqs:
@@ -286,19 +288,24 @@ func (c *client) readRequestsRoutine() {
 			// if len(c.dataStorage.pendingData) == 0 {
 			// 	flag = true
 			// }
-			flag = true
-			break
+			// flag = true
+			// break
+			return
 		case <-c.lostCxn:
 			if !completedReq {
 				errChan <- errors.New("lost cxn")
-				flag = true
+				//flag = true
 				close(c.closeInfoReq)
+				return
+			} else {
+				close(c.closeInfoReq)
+				return
 			}
 		}
-		if flag {
-			//close(c.closeInfoReq)
-			break
-		}
+		// if flag {
+		// 	//close(c.closeInfoReq)
+		// 	break
+		// }
 		value, exists := c.dataStorage.pendingData[currReq]
 		if exists {
 			//remove the value
@@ -311,22 +318,28 @@ func (c *client) readRequestsRoutine() {
 }
 
 func (c *client) readRoutine() {
-	var flag bool = false
+	//var flag bool = false
 	var dropData bool = false
 	for {
 		select {
 		case <-c.lostCxn:
-			flag = true
-			break
+			// flag = true
+			// break
+			return
 		case <-c.dataStorage.closed:
-			flag = true
-			break
+			// flag = true
+			// break
+			return
 		case <-c.willClose:
 			dropData = true
 		default:
 			//read message from server
 			var packet [2000]byte
-			bytesRead, _ := c.conn.Read(packet[0:])
+			bytesRead, err := c.conn.Read(packet[0:])
+			if err == io.EOF {
+				close(c.lostCxn)
+				break
+			}
 			var data Message
 			json.Unmarshal(packet[:bytesRead], &data)
 			select {
@@ -360,9 +373,9 @@ func (c *client) readRoutine() {
 			}
 
 		}
-		if flag {
-			break
-		}
+		// if flag {
+		// 	break
+		// }
 	}
 
 }
@@ -372,7 +385,7 @@ func (c *client) writeMsg(msg Message, ackChan chan Message, ticker *time.Ticker
 	var currentBackOff int = 0
 	var epochsPassed int = 0
 	//var totalEpochs int = 0
-	var flag bool = false
+	// var flag bool = false
 	c.conn.Write(byteMsg)
 	select {
 	case c.writtenChan <- true:
@@ -381,11 +394,13 @@ func (c *client) writeMsg(msg Message, ackChan chan Message, ticker *time.Ticker
 	for {
 		select {
 		case <-c.lostCxn:
-			flag = true
-			break
+			// flag = true
+			// break
+			return
 		case <-ackChan:
-			flag = true
-			break
+			// flag = true
+			// break
+			return
 		case <-ticker.C:
 			if epochsPassed == currentBackOff {
 				c.conn.Write(byteMsg)
@@ -409,30 +424,31 @@ func (c *client) writeMsg(msg Message, ackChan chan Message, ticker *time.Ticker
 				epochsPassed++
 			}
 		}
-		if flag {
-			break
-		}
+		// if flag {
+		// 	break
+		// }
 	}
 }
 
 func (c *client) writeRoutine() {
 	var needToClose bool = false
-	var flag bool = false
+	//var flag bool = false
 	for {
 		select {
 		case <-c.lostCxn:
 			//close(c.dataStorage.closed)
-			flag = true
+			//flag = true
+			return
 
 		case <-c.closeActivate:
 			if !needToClose {
-				close(c.willClose)
+				c.willClose <- true
 				needToClose = true
 			}
-			//fmt.Printf("pending: %d\n", c.window.pendingMsgs.Len())
 			if c.window.pendingMsgs.Len() == 0 {
 				close(c.dataStorage.closed)
-				flag = true
+				//flag = true
+				return
 			}
 
 		case payload := <-c.window.pendingMsgChan:
@@ -523,16 +539,17 @@ func (c *client) writeRoutine() {
 				count++
 			}
 			if needToClose && c.window.pendingMsgs.Len() == 0 {
-				flag = true
+				// flag = true
 				close(c.dataStorage.closed)
-				break
+				//break
+				return
 			}
 			c.window.numUnAcked += numStarted
 		}
 
-		if flag {
-			break
-		}
+		// if flag {
+		// 	break
+		// }
 
 	}
 }
@@ -604,6 +621,13 @@ func (c *client) Close() error {
 	c.closed = true
 
 	close(c.closeActivate)
-	<-c.dataStorage.closed
-	return nil
+	select {
+	case <-c.dataStorage.closed:
+		c.conn.Close()
+		return nil
+	case <-c.closeInfoReq:
+		c.conn.Close()
+		return nil
+	}
+	//<-c.dataStorage.closed
 }
