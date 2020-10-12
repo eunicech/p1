@@ -6,20 +6,19 @@ import (
 	"container/list"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/cmu440/lspnet"
 )
 
 type client struct {
-	epochLimit      int
-	windowSize      int
-	maxUnackedMsgs  int
-	maxBackOff      int
-	epochSize       int
-	ticker          *time.Ticker
-	timer           *time.Time
+	epochLimit     int
+	windowSize     int
+	maxUnackedMsgs int
+	maxBackOff     int
+	epochSize      int
+	ticker         *time.Ticker
+	// timer           *time.Time
 	clientID        int
 	conn            *lspnet.UDPConn
 	currSN          int      //keeps track of sequence numbers
@@ -39,6 +38,9 @@ type client struct {
 	unreadEpochs    int
 	readInEpoch     bool
 	readChan        chan bool
+	lostCxn         chan bool
+	willClose       chan bool
+	//closeInfoReq    chan bool
 }
 
 type data struct {
@@ -94,12 +96,14 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		addData:     make(chan Message),
 		closed:      make(chan bool),
 	}
+
 	window := &slidingWindow{
 		start:          1,
 		pendingMsgs:    list.New(),
 		pendingMsgChan: make(chan []byte),
 		numUnAcked:     0,
 	}
+
 	newClient := &client{
 		epochLimit:      params.EpochLimit,
 		windowSize:      params.WindowSize,
@@ -122,26 +126,29 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		closed:          false,
 		signalEpoch:     make(chan bool),
 		readChan:        make(chan bool),
+		//closeInfoReq:    make(chan bool),
+		lostCxn:   make(chan bool),
+		willClose: make(chan bool),
 	}
 
 	var epochsPassed int = 0
 	var totalEpochsPassed int = 0
 	var currentBackOff int = 0
+
 	//send connection
 	msg, err := json.Marshal(NewConnect())
 	if err != nil {
 		return nil, err
 	}
-	udp.Write(msg)
 	ackChan := make(chan Message)
-	errChan := make(chan error)
 	var ackMsg Message
-	go readConnection(ackChan, udp, errChan)
-
+	go readConnection(ackChan, udp)
+	udp.Write(msg)
 	var flag bool = false
+	ticker := time.NewTicker(time.Duration(params.EpochMillis * 1000000))
 	for {
 		select {
-		case <-newClient.ticker.C:
+		case <-ticker.C:
 			epochsPassed++
 			totalEpochsPassed++
 			if totalEpochsPassed > newClient.epochLimit {
@@ -165,11 +172,6 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		case ack := <-ackChan:
 			ackMsg = ack
 			flag = true
-			break
-		case newErr := <-errChan:
-			err = newErr
-			flag = true
-			break
 		}
 		if flag {
 			break
@@ -188,15 +190,11 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	return newClient, nil
 }
 
-func readConnection(ackChan chan Message, udp *lspnet.UDPConn, errChan chan error) {
+func readConnection(ackChan chan Message, udp *lspnet.UDPConn) {
 	for {
 		var ackMsg Message
 		var ack [2000]byte
-		bytesRead, err := udp.Read(ack[0:])
-		if err != nil {
-			errChan <- err
-			break
-		}
+		bytesRead, _ := udp.Read(ack[0:])
 		json.Unmarshal(ack[:bytesRead], &ackMsg)
 		if ackMsg.Type == MsgAck && ackMsg.SeqNum == 0 {
 			ackChan <- ackMsg
@@ -207,6 +205,7 @@ func readConnection(ackChan chan Message, udp *lspnet.UDPConn, errChan chan erro
 }
 
 func (c *client) clientInfoRequests() {
+	var flag bool = false
 	for {
 		select {
 		case <-c.getServerSN:
@@ -215,10 +214,16 @@ func (c *client) clientInfoRequests() {
 		case <-c.getClientSN:
 			c.clientSeqNumRes <- c.currSN
 			c.currSN++
-		case <-c.closeActivate:
-			c.closed = true
+		// case <-c.closeActivate:
+		// 	c.closed = true
+		// 	break
+		case <-c.dataStorage.closed:
+			flag = true
 			break
+		// case <-c.dataStorage.closed:
+		// 	stopSignallingEpochs = true
 		case <-c.ticker.C:
+
 			c.signalEpoch <- true
 			if !c.wroteInEpoch {
 				//send heartbeat
@@ -232,15 +237,23 @@ func (c *client) clientInfoRequests() {
 				// increment the number of epochs in which we haven't heard anything
 				c.unreadEpochs++
 				if c.unreadEpochs >= c.epochLimit {
-					c.conn.Close()
+					//c.conn.Close()
 					// TODO: drop the client/ connection
+					close(c.lostCxn)
 				}
+			} else {
+				c.readInEpoch = false
+				c.unreadEpochs = 0
 			}
+
 		case <-c.writtenChan:
 			c.wroteInEpoch = true
 		case <-c.readChan:
 			c.readInEpoch = true
-			c.unreadEpochs = 0
+			//c.unreadEpochs = 0
+		}
+		if flag {
+			break
 		}
 	}
 }
@@ -261,12 +274,18 @@ func (c *client) readRequestsRoutine() {
 			currChan = req.dataRes
 		case packet := <-c.dataStorage.addData:
 			//TODO: only add if it is >= current sn of server
-			c.dataStorage.pendingData[packet.SeqNum] = packet
+			if packet.SeqNum >= currReq {
+				c.dataStorage.pendingData[packet.SeqNum] = packet
+			}
 		case <-c.dataStorage.closed:
+			// if len(c.dataStorage.pendingData) == 0 {
+			// 	flag = true
+			// }
 			flag = true
 			break
 		}
 		if flag {
+			//close(c.closeInfoReq)
 			break
 		}
 		value, exists := c.dataStorage.pendingData[currReq]
@@ -280,38 +299,40 @@ func (c *client) readRequestsRoutine() {
 }
 
 func (c *client) readRoutine() {
+	var flag bool = false
+	var dropData bool = false
 	for {
 		select {
 		case <-c.dataStorage.closed:
+			flag = true
 			break
+		case <-c.willClose:
+			dropData = true
 		default:
 			//read message from server
 			var packet [2000]byte
 			bytesRead, _ := c.conn.Read(packet[0:])
 			var data Message
 			json.Unmarshal(packet[:bytesRead], &data)
-			// select {
-			// case c.readChan <- true:
-			// default:
-			// }
-			// checksum(c.clientID, sn, len(payload), payload)
+			select {
+			case c.readChan <- true:
+			default:
+			}
 
-			c.readChan <- true
+			// c.readChan <- true
 			//check if this an acknowledgement
 			if data.Type == MsgAck {
 				//ignore heartbeats
 				if data.SeqNum != 0 {
 					c.acks <- data
 				}
-			} else {
+			} else if !dropData {
 				//data message
-				var payload []byte = data.Payload
 				if data.Size < len(data.Payload) {
-					payload = data.Payload[:data.Size]
+					data.Payload = data.Payload[:data.Size]
 				}
-				chksum := c.checksum(data.ConnID, data.SeqNum, data.Size, payload)
+				chksum := c.checksum(data.ConnID, data.SeqNum, data.Size, data.Payload)
 				if data.Size > len(data.Payload) || chksum != data.Checksum {
-					fmt.Println("Failed Checksum")
 					continue
 				}
 				ack, _ := json.Marshal(NewAck(c.clientID, data.SeqNum))
@@ -324,16 +345,18 @@ func (c *client) readRoutine() {
 			}
 
 		}
+		if flag {
+			break
+		}
 	}
 
 }
 
 func (c *client) writeMsg(msg Message, ackChan chan Message, sigEpoch chan bool) {
-	// fmt.Printf("Trying to write %+v\n", msg)
 	byteMsg, _ := json.Marshal(&msg)
 	var currentBackOff int = 0
 	var epochsPassed int = 0
-	var totalEpochs int = 0
+	//var totalEpochs int = 0
 	var flag bool = false
 	c.conn.Write(byteMsg)
 	select {
@@ -342,13 +365,15 @@ func (c *client) writeMsg(msg Message, ackChan chan Message, sigEpoch chan bool)
 	}
 	for {
 		select {
+		case <-c.lostCxn:
+			//fmt.Println("Lost connection")
+			flag = true
+			break
 		case <-ackChan:
 			flag = true
 			break
 		case <-sigEpoch:
-			epochsPassed++
-			totalEpochs++
-			if epochsPassed > currentBackOff {
+			if epochsPassed == currentBackOff {
 				c.conn.Write(byteMsg)
 				select {
 				case c.writtenChan <- true:
@@ -366,6 +391,8 @@ func (c *client) writeMsg(msg Message, ackChan chan Message, sigEpoch chan bool)
 					}
 				}
 
+			} else {
+				epochsPassed++
 			}
 		}
 		if flag {
@@ -375,12 +402,28 @@ func (c *client) writeMsg(msg Message, ackChan chan Message, sigEpoch chan bool)
 }
 
 func (c *client) writeRoutine() {
-	//var needToClose bool = false
+	var needToClose bool = false
+	var flag bool = false
 	for {
 		select {
-		case <-c.closeActivate:
+		case <-c.lostCxn:
 			close(c.dataStorage.closed)
-			break
+			flag = true
+
+		case <-c.closeActivate:
+			// if !needToClose {
+			// c.dataStorage.willClose <- true
+			c.willClose <- true
+			needToClose = true
+			//fmt.Printf("pending: %d\n", c.window.pendingMsgs.Len())
+			if c.window.pendingMsgs.Len() == 0 {
+				close(c.dataStorage.closed)
+				flag = true
+			}
+
+			// c.closed = true
+			// }
+			// break
 		case payload := <-c.window.pendingMsgChan:
 			c.getClientSN <- true
 			sn := <-c.clientSeqNumRes
@@ -400,6 +443,7 @@ func (c *client) writeRoutine() {
 				go c.writeMsg(*dataMsg, ackChan, newSignalEpoch)
 				c.window.numUnAcked++
 			}
+
 		case <-c.signalEpoch:
 			//signal epochs to all messages in window
 			count := 0
@@ -475,8 +519,16 @@ func (c *client) writeRoutine() {
 				}
 				count++
 			}
+			if needToClose && c.window.pendingMsgs.Len() == 0 {
+				flag = true
+				close(c.dataStorage.closed)
+				break
+			}
 			c.window.numUnAcked += numStarted
+		}
 
+		if flag {
+			break
 		}
 
 	}
@@ -538,6 +590,9 @@ func (c *client) Close() error {
 	if c.closed {
 		return errors.New("Client already closed")
 	}
+	c.closed = true
+	//fmt.Println("Close called")
+
 	close(c.closeActivate)
 	<-c.dataStorage.closed
 	return nil

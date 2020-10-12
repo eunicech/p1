@@ -6,7 +6,6 @@ import (
 	"container/list"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"strconv"
 	"time"
 
@@ -21,7 +20,8 @@ type server struct {
 	clientMap      map[int]*clientInfo
 	clientNum      int
 	conn           *lspnet.UDPConn
-	readRes        chan Message
+	readRes        chan *readResult
+	writeRes       chan error
 	pendingMsgs    chan Message
 	pendingMsgChan chan Message
 	closed         bool
@@ -33,6 +33,13 @@ type server struct {
 	hasPendingAck  chan *Message
 	ticker         *time.Ticker
 	writtenChan    chan int
+	clientErr      *list.List
+}
+
+type readResult struct {
+	msg []byte
+	err error
+	id  int
 }
 
 type request struct {
@@ -63,13 +70,13 @@ type clientInfo struct {
 	ack            chan Message
 	addr           *lspnet.UDPAddr
 	storedMessages map[int]Message
-	closed         chan bool
-	toWrite        int
-	closeActivate  bool
+	serverClosed   chan bool
+	cxnClosed      chan bool
 	slidingWin     *serverSlidingWindow
 	wroteInEpoch   bool
 	readInEpoch    bool
 	unreadEpochs   int
+	lost           bool
 }
 
 type serverSlidingWindow struct {
@@ -112,7 +119,8 @@ func NewServer(port int, params *Params) (Server, error) {
 		clientMap:      make(map[int]*clientInfo),
 		clientNum:      1,
 		conn:           udpconn,
-		readRes:        make(chan Message),
+		readRes:        make(chan *readResult),
+		writeRes:       make(chan error),
 		pendingMsgs:    make(chan Message),
 		pendingMsgChan: make(chan Message),
 		closed:         false,
@@ -123,6 +131,7 @@ func NewServer(port int, params *Params) (Server, error) {
 		pendingAckList: list.New(),
 		ticker:         time.NewTicker(time.Duration(1000000 * params.EpochMillis)),
 		writtenChan:    make(chan int),
+		clientErr:      list.New(),
 	}
 
 	go newServer.readRoutine()
@@ -132,6 +141,7 @@ func NewServer(port int, params *Params) (Server, error) {
 func (s *server) mapRequestHandler() {
 	var failedReqs int = 0
 	for {
+		// fmt.Println("Map Request handler")
 		select {
 		case req := <-s.reqChan:
 			switch req.reqType {
@@ -145,20 +155,19 @@ func (s *server) mapRequestHandler() {
 				s.clientMap[client.clientID] = client
 			case AddMsg:
 				// fmt.Printf("Adding message %+v\n", req.addMsg)
-				client, _ := s.clientMap[req.clientID]
-				// if !ok {
-				// 	continue
-				// }
+				client, ok := s.clientMap[req.clientID]
+				if !ok || client.lost {
+					continue
+				}
 				client.readInEpoch = true
+				client.unreadEpochs = 0
 				msg := req.addMsg
 				switch msg.Type {
 				case MsgAck:
 					ack := msg
 					client := s.clientMap[ack.ConnID]
-					//check if its a heartbeat
-					if ack.SeqNum == 0 {
-						//TODO: say we read from client
-					} else {
+					//only add if not a heartbeat
+					if ack.SeqNum != 0 {
 						//add acknowledgement
 						for curr := client.slidingWin.pendingMsgs.Front(); curr != nil; curr = curr.Next() {
 							currElem := curr.Value.(*writeElem)
@@ -204,7 +213,7 @@ func (s *server) mapRequestHandler() {
 									if wElem.sn >= client.slidingWin.start+s.windowSize {
 										break
 									}
-									go s.writeMsg(client.addr, *wElem.msg, wElem.ackChan, wElem.signalEpoch)
+									go s.writeMsg(client.addr, *wElem.msg, wElem.ackChan, wElem.signalEpoch, client.cxnClosed)
 									numStarted++
 								} else {
 									break
@@ -216,7 +225,9 @@ func (s *server) mapRequestHandler() {
 					}
 
 				case MsgData:
-					client.storedMessages[msg.SeqNum] = *msg
+					if msg.SeqNum >= client.clientSN {
+						client.storedMessages[msg.SeqNum] = *msg
+					}
 				}
 			case ReadReq:
 				var cr *clientInfo
@@ -233,17 +244,31 @@ func (s *server) mapRequestHandler() {
 					res := cr.storedMessages[cr.clientSN]
 					delete(cr.storedMessages, cr.clientSN)
 					cr.clientSN++
+					result := &readResult{
+						msg: res.Payload,
+						err: nil,
+						id:  res.ConnID,
+					}
+					s.readRes <- result
+				} else if s.clientErr.Front() != nil {
+					//get error off list
+					elem := s.clientErr.Front()
+					res := elem.Value.(*readResult)
+					s.clientErr.Remove(elem)
 					s.readRes <- res
-					// fmt.Printf("CLIENT SN: %d\n", cr.client_sn)
 				} else {
 					failedReqs++
 				}
+
 			case WriteMessage:
+				//check if client exists
+				client, ok := s.clientMap[req.clientID]
+				if !ok || client.lost {
+					s.writeRes <- errors.New("client does not exist")
+					continue
+				}
+				s.writeRes <- nil
 				// get the current client sn and update it accordingly
-				client, _ := s.clientMap[req.clientID]
-				// if !ok {
-				// 	continue
-				// }
 				sn := client.currSN
 				client.currSN++
 
@@ -265,20 +290,16 @@ func (s *server) mapRequestHandler() {
 
 				client.slidingWin.pendingMsgs.PushBack(newElem)
 				if client.slidingWin.pendingMsgs.Len() <= s.maxUnackedMsgs && newElem.sn < client.slidingWin.start+s.windowSize {
-					go s.writeMsg(client.addr, *dataMsg, ackChan, newSignalEpoch)
+					go s.writeMsg(client.addr, *dataMsg, ackChan, newSignalEpoch, client.cxnClosed)
 					client.slidingWin.numUnAcked++
 				}
 			case CloseCxn:
 				client, ok := s.clientMap[req.clientID]
-				if !ok {
+				if !ok || client.lost {
 					req.closeResChan <- true
 				} else {
-					client.closeActivate = true
-					//TODO: why are we subtracting here...
-					client.toWrite--
-					if client.toWrite == 0 && client.closeActivate {
-						delete(s.clientMap, req.clientID)
-					}
+					close(client.cxnClosed)
+					delete(s.clientMap, req.clientID)
 					req.closeResChan <- false
 				}
 			}
@@ -287,56 +308,78 @@ func (s *server) mapRequestHandler() {
 			//TODO signal the close
 			break
 		case <-s.ticker.C:
+			//start := time.Now()
 			var toDelete []int
 			for k, v := range s.clientMap {
 				//check if we need to send a heartbeat
 				if !v.wroteInEpoch {
-					ackMsg := NewAck(v.clientID, 0)
+					ackMsg := NewAck(k, 0)
 					byteMsg, _ := json.Marshal(&ackMsg)
 					s.conn.WriteToUDP(byteMsg, v.addr)
 				}
 				v.wroteInEpoch = false
-				//signal elements in sliding window
-				slidingWindow := v.slidingWin
-				count := 0
-				for elem := slidingWindow.pendingMsgs.Front(); elem != nil && count < slidingWindow.start+s.maxUnackedMsgs; elem = elem.Next() {
-					currElem := elem.Value.(*writeElem)
-					if currElem.sn >= slidingWindow.start+s.windowSize {
-						break
+				//check if the connection is lost
+				if v.lost {
+					toDelete = append(toDelete, v.clientID)
+				} else {
+					if !v.readInEpoch {
+						v.unreadEpochs++
+						if v.unreadEpochs >= s.epochLimit {
+							v.lost = true
+							toDelete = append(toDelete, v.clientID)
+						}
 					}
-					if !currElem.gotAck {
-						go func() {
-							select {
-							case currElem.signalEpoch <- true:
-							default:
+					v.readInEpoch = false
+
+					if !v.lost {
+						//signal elements in sliding window
+						slidingWindow := v.slidingWin
+						count := 0
+						for elem := slidingWindow.pendingMsgs.Front(); elem != nil && count < slidingWindow.start+s.maxUnackedMsgs; elem = elem.Next() {
+							currElem := elem.Value.(*writeElem)
+							if currElem.sn >= slidingWindow.start+s.windowSize {
+								break
 							}
-						}()
+							if !currElem.gotAck {
+								go func() {
+									currElem.signalEpoch <- false
+								}()
+							}
+							count++
+						}
+					} else {
+						//signal cxn as closed
+						close(v.cxnClosed)
+						//remove pending messages
+						v.slidingWin.pendingMsgs.Init()
 					}
-					count++
+
 				}
 
-				if !v.readInEpoch {
-					v.unreadEpochs++
-					if v.unreadEpochs >= s.epochLimit {
-						// delete it from the map somehow
-						toDelete = append(toDelete, k)
+			}
+			//find lost clients
+			for v := range toDelete {
+				//check if lost
+				client, ok := s.clientMap[v]
+				if ok && len(client.storedMessages) == 0 {
+					err := &readResult{
+						id:  client.clientID,
+						err: errors.New("Lost a client"),
 					}
+					delete(s.clientMap, v)
+					s.clientErr.PushBack(err)
 				}
-			}
 
-			for _, clientID := range toDelete {
-				delete(s.clientMap, clientID)
 			}
+			// fmt.Println(time.Since(start))
 		case clientNum := <-s.writtenChan:
 			client := s.clientMap[clientNum]
 			client.wroteInEpoch = true
 		}
-
 		if failedReqs > 0 {
 			var cr *clientInfo
 			var found bool = false
 			for _, v := range s.clientMap {
-				// fmt.Println("Curr: " + strconv.Itoa(v.client_sn))
 				_, ok := v.storedMessages[v.clientSN]
 				if ok {
 					cr = v
@@ -347,8 +390,19 @@ func (s *server) mapRequestHandler() {
 			if found {
 				res := cr.storedMessages[cr.clientSN]
 				delete(cr.storedMessages, cr.clientSN)
-				cr.clientSN = cr.clientSN + 1
-				// fmt.Printf("CLIENT SN: %d\n", cr.client_sn)
+				cr.clientSN++
+				result := &readResult{
+					msg: res.Payload,
+					id:  res.ConnID,
+					err: nil,
+				}
+				s.readRes <- result
+				failedReqs--
+			} else if s.clientErr.Front() != nil {
+				//get error off list
+				elem := s.clientErr.Front()
+				res := elem.Value.(*readResult)
+				s.clientErr.Remove(elem)
 				s.readRes <- res
 				failedReqs--
 			}
@@ -356,10 +410,9 @@ func (s *server) mapRequestHandler() {
 	}
 }
 
-func (s *server) writeMsg(addr *lspnet.UDPAddr, msg Message, ack chan Message, newSignalEpoch chan bool) {
+func (s *server) writeMsg(addr *lspnet.UDPAddr, msg Message, ack chan Message, newSignalEpoch chan bool, cxnClosed chan bool) {
 	byteMsg, _ := json.Marshal(&(msg))
 	s.conn.WriteToUDP(byteMsg, addr)
-	s.writtenChan <- msg.ConnID
 
 	var flag = false
 	var currentBackOff int = 0
@@ -386,6 +439,8 @@ func (s *server) writeMsg(addr *lspnet.UDPAddr, msg Message, ack chan Message, n
 					}
 				}
 			}
+		case <-cxnClosed:
+			flag = true
 		}
 		if flag {
 			break
@@ -419,10 +474,10 @@ func (s *server) readRoutine() {
 					ack:            make(chan Message),
 					addr:           addr,
 					storedMessages: make(map[int]Message),
-					closed:         make(chan bool),
-					toWrite:        0,
-					closeActivate:  false,
 					slidingWin:     newWindow,
+					lost:           false,
+					serverClosed:   make(chan bool),
+					cxnClosed:      make(chan bool),
 				}
 				req := request{
 					reqType:   AddClient,
@@ -433,13 +488,11 @@ func (s *server) readRoutine() {
 				//check if data message and need to send ack
 				if data.Type == MsgData {
 					//verify checksum
-					var payload []byte = data.Payload
 					if data.Size < len(data.Payload) {
-						payload = data.Payload[:data.Size]
+						data.Payload = data.Payload[:data.Size]
 					}
-					chksum := s.checksum(data.ConnID, data.SeqNum, data.Size, payload)
+					chksum := s.checksum(data.ConnID, data.SeqNum, data.Size, data.Payload)
 					if data.Size > len(data.Payload) || chksum != data.Checksum {
-						fmt.Println("Server Failed Checksum")
 						continue
 					}
 					ack, _ := json.Marshal(NewAck(data.ConnID, data.SeqNum))
@@ -486,6 +539,7 @@ func (s *server) checksum(connID int, seqNum int, size int, payload []byte) uint
 }
 
 func (s *server) Read() (int, []byte, error) {
+	// fmt.Println("Read called")
 	//create request
 	// fmt.Println("called read")
 	req := request{
@@ -493,11 +547,12 @@ func (s *server) Read() (int, []byte, error) {
 	}
 	s.reqChan <- req
 	//wait for result
-	msg := <-s.readRes
-	return msg.ConnID, msg.Payload, nil
+	res := <-s.readRes
+	return res.id, res.msg, res.err
 }
 
 func (s *server) Write(connID int, payload []byte) error {
+	// fmt.Println("Write called")
 	req := request{
 		reqType:  WriteMessage,
 		clientID: connID,
@@ -506,8 +561,8 @@ func (s *server) Write(connID int, payload []byte) error {
 
 	s.reqChan <- req
 	// s.pendingMsgChan <- *data
-
-	return nil
+	err := <-s.writeRes
+	return err
 }
 
 func (s *server) CloseConn(connID int) error {
@@ -530,6 +585,6 @@ func (s *server) Close() error {
 		return errors.New("server already closed")
 	}
 	close(s.closeActivate)
-	<-s.readingClose
+	//<-s.readingClose
 	return nil
 }
