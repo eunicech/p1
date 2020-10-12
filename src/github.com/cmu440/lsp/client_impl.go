@@ -17,6 +17,7 @@ type client struct {
 	maxUnackedMsgs int
 	maxBackOff     int
 	epochSize      int
+	epochMillis    int
 	ticker         *time.Ticker
 	// timer           *time.Time
 	clientID        int
@@ -40,7 +41,8 @@ type client struct {
 	readChan        chan bool
 	lostCxn         chan bool
 	willClose       chan bool
-	//closeInfoReq    chan bool
+	closeInfoReq    chan bool
+	infoReq         chan bool
 }
 
 type data struct {
@@ -53,6 +55,7 @@ type data struct {
 type readReq struct {
 	dataSN  int
 	dataRes chan Message
+	errChan chan error
 }
 
 type slidingWindow struct {
@@ -63,11 +66,11 @@ type slidingWindow struct {
 }
 
 type windowElem struct {
-	sn          int
-	ackChan     chan Message
-	signalEpoch chan bool
-	msg         *Message
-	gotAck      bool
+	sn      int
+	ackChan chan Message
+	ticker  *time.Ticker
+	msg     *Message
+	gotAck  bool
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -109,6 +112,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		windowSize:      params.WindowSize,
 		maxBackOff:      params.MaxBackOffInterval,
 		maxUnackedMsgs:  params.MaxUnackedMessages,
+		epochMillis:     params.EpochMillis,
 		writtenChan:     make(chan bool),
 		epochSize:       params.EpochMillis,
 		ticker:          time.NewTicker(time.Duration(params.EpochMillis * 1000000)),
@@ -124,11 +128,11 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		dataStorage:     dataStore,
 		closeActivate:   make(chan bool),
 		closed:          false,
-		signalEpoch:     make(chan bool),
 		readChan:        make(chan bool),
-		//closeInfoReq:    make(chan bool),
-		lostCxn:   make(chan bool),
-		willClose: make(chan bool),
+		closeInfoReq:    make(chan bool),
+		lostCxn:         make(chan bool),
+		willClose:       make(chan bool),
+		infoReq:         make(chan bool),
 	}
 
 	var epochsPassed int = 0
@@ -214,17 +218,14 @@ func (c *client) clientInfoRequests() {
 		case <-c.getClientSN:
 			c.clientSeqNumRes <- c.currSN
 			c.currSN++
-		// case <-c.closeActivate:
-		// 	c.closed = true
-		// 	break
 		case <-c.dataStorage.closed:
 			flag = true
 			break
-		// case <-c.dataStorage.closed:
-		// 	stopSignallingEpochs = true
+		case <-c.closeInfoReq:
+			flag = true
+			break
 		case <-c.ticker.C:
-
-			c.signalEpoch <- true
+			// c.signalEpoch <- true
 			if !c.wroteInEpoch {
 				//send heartbeat
 				ackMsg := NewAck(c.clientID, 0)
@@ -236,7 +237,7 @@ func (c *client) clientInfoRequests() {
 			if !c.readInEpoch {
 				// increment the number of epochs in which we haven't heard anything
 				c.unreadEpochs++
-				if c.unreadEpochs >= c.epochLimit {
+				if c.unreadEpochs == c.epochLimit {
 					//c.conn.Close()
 					// TODO: drop the client/ connection
 					close(c.lostCxn)
@@ -265,6 +266,8 @@ func (c *client) ConnID() int {
 func (c *client) readRequestsRoutine() {
 	var currReq int
 	var currChan chan Message
+	var errChan chan error
+	var completedReq bool = true
 	var flag bool = false
 	for {
 		select {
@@ -272,6 +275,8 @@ func (c *client) readRequestsRoutine() {
 			//assumes another read request from client can't come until this one is fulfilled
 			currReq = req.dataSN
 			currChan = req.dataRes
+			errChan = req.errChan
+			completedReq = false
 		case packet := <-c.dataStorage.addData:
 			//TODO: only add if it is >= current sn of server
 			if packet.SeqNum >= currReq {
@@ -283,6 +288,12 @@ func (c *client) readRequestsRoutine() {
 			// }
 			flag = true
 			break
+		case <-c.lostCxn:
+			if !completedReq {
+				errChan <- errors.New("lost cxn")
+				flag = true
+				close(c.closeInfoReq)
+			}
 		}
 		if flag {
 			//close(c.closeInfoReq)
@@ -294,6 +305,7 @@ func (c *client) readRequestsRoutine() {
 			delete(c.dataStorage.pendingData, currReq)
 			//add value to channel
 			currChan <- value
+			completedReq = true
 		}
 	}
 }
@@ -303,6 +315,9 @@ func (c *client) readRoutine() {
 	var dropData bool = false
 	for {
 		select {
+		case <-c.lostCxn:
+			flag = true
+			break
 		case <-c.dataStorage.closed:
 			flag = true
 			break
@@ -352,7 +367,7 @@ func (c *client) readRoutine() {
 
 }
 
-func (c *client) writeMsg(msg Message, ackChan chan Message, sigEpoch chan bool) {
+func (c *client) writeMsg(msg Message, ackChan chan Message, ticker *time.Ticker) {
 	byteMsg, _ := json.Marshal(&msg)
 	var currentBackOff int = 0
 	var epochsPassed int = 0
@@ -366,13 +381,12 @@ func (c *client) writeMsg(msg Message, ackChan chan Message, sigEpoch chan bool)
 	for {
 		select {
 		case <-c.lostCxn:
-			//fmt.Println("Lost connection")
 			flag = true
 			break
 		case <-ackChan:
 			flag = true
 			break
-		case <-sigEpoch:
+		case <-ticker.C:
 			if epochsPassed == currentBackOff {
 				c.conn.Write(byteMsg)
 				select {
@@ -407,63 +421,48 @@ func (c *client) writeRoutine() {
 	for {
 		select {
 		case <-c.lostCxn:
-			close(c.dataStorage.closed)
+			//close(c.dataStorage.closed)
 			flag = true
 
 		case <-c.closeActivate:
-			// if !needToClose {
-			// c.dataStorage.willClose <- true
-			c.willClose <- true
-			needToClose = true
+			if !needToClose {
+				close(c.willClose)
+				needToClose = true
+			}
 			//fmt.Printf("pending: %d\n", c.window.pendingMsgs.Len())
 			if c.window.pendingMsgs.Len() == 0 {
 				close(c.dataStorage.closed)
 				flag = true
 			}
 
-			// c.closed = true
-			// }
-			// break
 		case payload := <-c.window.pendingMsgChan:
 			c.getClientSN <- true
 			sn := <-c.clientSeqNumRes
 			chkSum := c.checksum(c.clientID, sn, len(payload), payload)
 			dataMsg := NewData(c.clientID, sn, len(payload), payload, chkSum)
 			ackChan := make(chan Message)
-			newSignalEpoch := make(chan bool)
 			newElem := &windowElem{
-				sn:          sn,
-				msg:         dataMsg,
-				ackChan:     ackChan,
-				gotAck:      false,
-				signalEpoch: newSignalEpoch,
+				sn:      sn,
+				msg:     dataMsg,
+				ackChan: ackChan,
+				gotAck:  false,
 			}
+
 			c.window.pendingMsgs.PushBack(newElem)
-			if c.window.pendingMsgs.Len() <= c.maxUnackedMsgs && newElem.sn < c.window.start+c.windowSize {
-				go c.writeMsg(*dataMsg, ackChan, newSignalEpoch)
+			if c.window.pendingMsgs.Len() == 1 {
+				c.window.start = newElem.sn
+				newTicker := time.NewTicker(time.Duration(c.epochMillis * 1000000))
+				newElem.ticker = newTicker
+				go c.writeMsg(*dataMsg, ackChan, newTicker)
+				c.window.numUnAcked++
+			} else if c.window.pendingMsgs.Len() <= c.maxUnackedMsgs && newElem.sn < c.window.start+c.windowSize {
+				newTicker := time.NewTicker(time.Duration(c.epochMillis * 1000000))
+				newElem.ticker = newTicker
+				go c.writeMsg(*dataMsg, ackChan, newTicker)
 				c.window.numUnAcked++
 			}
 
-		case <-c.signalEpoch:
-			//signal epochs to all messages in window
-			count := 0
-			for elem := c.window.pendingMsgs.Front(); elem != nil && count < c.window.start+c.maxUnackedMsgs; elem = elem.Next() {
-				currElem := elem.Value.(*windowElem)
-				if currElem.sn >= c.window.start+c.windowSize {
-					break
-				}
-				if !currElem.gotAck {
-					go func() {
-						select {
-						case currElem.signalEpoch <- true:
-						default:
-						}
-					}()
-				}
-				count++
-			}
 		case ack := <-c.acks:
-			//fmt.Printf("Got ack: %d\n", ack.SeqNum)
 			//put ack in corresponding channel
 			sn := ack.SeqNum
 			for elem := c.window.pendingMsgs.Front(); elem != nil; elem = elem.Next() {
@@ -498,7 +497,9 @@ func (c *client) writeRoutine() {
 				currElem = nextElem
 			}
 			//update start of window
-			c.window.start += removedFromStart
+			if c.window.pendingMsgs.Front() != nil {
+				c.window.start = c.window.pendingMsgs.Front().Value.(*windowElem).sn
+			}
 
 			//update window
 			count = 0
@@ -511,7 +512,9 @@ func (c *client) writeRoutine() {
 						if wElem.sn >= c.window.start+c.windowSize {
 							break
 						}
-						go c.writeMsg(*wElem.msg, wElem.ackChan, wElem.signalEpoch)
+						newTicker := time.NewTicker(time.Duration(c.epochMillis * 1000000))
+						wElem.ticker = newTicker
+						go c.writeMsg(*wElem.msg, wElem.ackChan, newTicker)
 						numStarted++
 					} else {
 						break
@@ -565,19 +568,26 @@ func (c *client) checksum(connID int, seqNum int, size int, payload []byte) uint
 
 func (c *client) Read() ([]byte, error) {
 	//get number of data packet you need to read
+	if c.closed {
+		return nil, errors.New("already closed")
+	}
 	c.getServerSN <- true
 	sn := <-c.serverSeqNumRes
+	err := make(chan error)
 	result := make(chan Message)
 	//create read request
 	request := readReq{
 		dataSN:  sn,
 		dataRes: result,
+		errChan: err,
 	}
 	c.dataStorage.readReqs <- request
-	//wait for data
-	data := <-request.dataRes
-
-	return data.Payload, nil
+	select {
+	case data := <-request.dataRes:
+		return data.Payload, nil
+	case err := <-request.errChan:
+		return nil, err
+	}
 }
 
 func (c *client) Write(payload []byte) error {
@@ -586,12 +596,12 @@ func (c *client) Write(payload []byte) error {
 }
 
 func (c *client) Close() error {
+
 	//check if client was already closed
 	if c.closed {
 		return errors.New("Client already closed")
 	}
 	c.closed = true
-	//fmt.Println("Close called")
 
 	close(c.closeActivate)
 	<-c.dataStorage.closed
