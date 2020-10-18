@@ -574,8 +574,8 @@ func (s *server) readRoutine() {
 					if data.Size < len(data.Payload) {
 						data.Payload = data.Payload[:data.Size]
 					}
-					chksum := s.checksum(data.ConnID, data.SeqNum, data.Size, data.Payload)
-					if data.Size > len(data.Payload) || chksum != data.Checksum {
+					//chksum := s.checksum(data.ConnID, data.SeqNum, data.Size, data.Payload)
+					if data.Size > len(data.Payload) {
 						continue
 					}
 					// send ack

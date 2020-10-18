@@ -364,8 +364,8 @@ func (c *client) readRoutine() {
 				}
 
 				// check checksum to ensure data integrity
-				chksum := c.checksum(data.ConnID, data.SeqNum, data.Size, data.Payload)
-				if data.Size > len(data.Payload) || chksum != data.Checksum {
+				//chksum := c.checksum(data.ConnID, data.SeqNum, data.Size, data.Payload)
+				if data.Size > len(data.Payload) {
 					continue
 				}
 				ack, _ := json.Marshal(NewAck(c.clientID, data.SeqNum))
