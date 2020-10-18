@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
 
+	"github.com/cmu440/bitcoin"
 	"github.com/cmu440/lsp"
 )
 
@@ -30,11 +32,23 @@ func main() {
 
 	defer client.Close()
 
-	_ = message    // Keep compiler happy. Please remove!
-	_ = maxNonce   // Keep compiler happy. Please remove!
-	// TODO: implement this!
+	req := bitcoin.NewRequest(message, 0, maxNonce)
+	msg, err := json.Marshal(req)
+	if err != nil {
+		fmt.Println("error marshalling request message")
+		return
+	}
+	client.Write(msg)
+	resMsg, err := client.Read()
+	if err != nil {
+		//assume the error means we lost connection with the server
+		printDisconnected()
+		return
+	}
+	var result bitcoin.Message
+	json.Unmarshal(resMsg, &result)
 
-	printResult(0, 0)
+	printResult(result.Hash, result.Nonce)
 }
 
 // printResult prints the final result to stdout.
