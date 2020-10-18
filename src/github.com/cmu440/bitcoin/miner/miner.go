@@ -53,7 +53,7 @@ func main() {
 	}
 
 	defer miner.Close()
-
+	var count = 0
 	// TODO: implement this!
 	for {
 		msg, err := miner.Read()
@@ -67,5 +67,7 @@ func main() {
 		result := bitcoin.NewResult(hash, nonce)
 		resMsg, _ := json.Marshal(result)
 		miner.Write(resMsg)
+		fmt.Println(count)
+		count++
 	}
 }

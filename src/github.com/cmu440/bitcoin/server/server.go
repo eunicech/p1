@@ -38,9 +38,9 @@ type reqInfo struct {
 
 type clientInfo struct {
 	//NEVER INIT THIS
-	onLast bool
-	hash   uint64
-	nonce  uint64
+	numReqs int
+	hash    uint64
+	nonce   uint64
 }
 
 func startServer(port int) (*server, error) {
@@ -56,7 +56,8 @@ func startServer(port int) (*server, error) {
 		clientMap:   make(map[int]*clientInfo),
 		freeMiners:  list.New(),
 		busyMiners:  make(map[int]*reqInfo),
-		msgSize:     10,
+		//msgSize:     1000,
+		msgSize: 3,
 	}
 
 	return newServer, nil
@@ -78,7 +79,7 @@ func dispatchMiner(srv *server, connID int) {
 		srv.pendingReqs.Remove(elem)
 		var newReq *bitcoin.Message
 		var minerReq *reqInfo
-		if request.upper-request.lower <= srv.msgSize {
+		if request.upper-request.lower+1 <= srv.msgSize {
 			newReq = bitcoin.NewRequest(request.data, request.lower, request.upper)
 			minerReq = &reqInfo{
 				clientID: request.clientID,
@@ -86,18 +87,15 @@ func dispatchMiner(srv *server, connID int) {
 				lower:    request.lower,
 				upper:    request.upper,
 			}
-			client := srv.clientMap[minerReq.clientID]
-			client.onLast = true
-
 		} else {
-			newReq = bitcoin.NewRequest(request.data, request.lower, request.lower+srv.msgSize)
+			newReq = bitcoin.NewRequest(request.data, request.lower, request.lower+srv.msgSize-1)
 			minerReq = &reqInfo{
 				clientID: request.clientID,
 				data:     request.data,
 				lower:    request.lower,
 				upper:    request.lower + srv.msgSize,
 			}
-			request.lower = request.lower + srv.msgSize + 1
+			request.lower = request.lower + srv.msgSize
 			srv.pendingReqs.PushBack(request)
 		}
 
@@ -129,7 +127,17 @@ func handleServer(srv *server, closed chan bool) {
 					if isBusy {
 						srv.pendingReqs.PushFront(req)
 						delete(srv.busyMiners, data.connId)
-						//do we need to dispatch miners here?
+						curr := srv.freeMiners.Front()
+						for curr != nil {
+							next := curr.Next()
+							if srv.pendingReqs.Len() == 0 {
+								break
+							}
+							miner := curr.Value.(int)
+							srv.freeMiners.Remove(curr)
+							curr = next
+							dispatchMiner(srv, miner)
+						}
 					} else {
 						for curr := srv.freeMiners.Front(); curr != nil; curr = curr.Next() {
 							if curr.Value.(int) == data.connId {
@@ -146,7 +154,16 @@ func handleServer(srv *server, closed chan bool) {
 					LOGF.Printf("Miner joined, %d", data.connId)
 					dispatchMiner(srv, data.connId)
 				case bitcoin.Result:
-					miner := srv.busyMiners[data.connId]
+					miner, ok := srv.busyMiners[data.connId]
+					if !ok {
+						LOGF.Println("WHERE TF DID THE MINER GO... man down")
+						//is it on the free list?
+						for elem := srv.freeMiners.Front(); elem != nil; elem = elem.Next() {
+							if elem.Value.(int) == data.connId {
+								LOGF.Println("WE FOUND HIM!!!")
+							}
+						}
+					}
 					client, ok := srv.clientMap[miner.clientID]
 					if !ok {
 						continue
@@ -155,7 +172,8 @@ func handleServer(srv *server, closed chan bool) {
 						client.hash = data.msg.Hash
 						client.nonce = data.msg.Nonce
 					}
-					if client.onLast {
+					client.numReqs--
+					if client.numReqs == 0 {
 						LOGF.Printf("found result for client %d", miner.clientID)
 						go writeResult(client.hash, client.nonce, miner.clientID, srv.lspServer)
 						//remove client since request is done
@@ -173,17 +191,21 @@ func handleServer(srv *server, closed chan bool) {
 						upper:    data.msg.Upper,
 					}
 					newClientReq := &clientInfo{
-						onLast: false,
-						hash:   ^uint64(0),
-						nonce:  0,
+						numReqs: int((data.msg.Upper + srv.msgSize) / srv.msgSize),
+						hash:    ^uint64(0),
+						nonce:   0,
 					}
 					srv.clientMap[data.connId] = newClientReq
 					srv.pendingReqs.PushBack(request)
-					for curr := srv.freeMiners.Front(); curr != nil; curr = curr.Next() {
+					curr := srv.freeMiners.Front()
+					for curr != nil {
+						next := curr.Next()
 						if srv.pendingReqs.Len() == 0 {
 							break
 						}
 						miner := curr.Value.(int)
+						srv.freeMiners.Remove(curr)
+						curr = next
 						dispatchMiner(srv, miner)
 					}
 				}
