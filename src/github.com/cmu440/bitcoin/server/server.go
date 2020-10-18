@@ -15,7 +15,7 @@ import (
 type server struct {
 	lspServer   lsp.Server
 	pendingReqs *list.List
-	clientMap   map[int]clientInfo
+	clientMap   map[int]*clientInfo
 	reqChan     chan *serverReq
 	freeMiners  *list.List
 	// freeMiners map[int]int
@@ -37,9 +37,10 @@ type reqInfo struct {
 }
 
 type clientInfo struct {
-	requestNum int
-	hash       uint64
-	nonce      uint64
+	//NEVER INIT THIS
+	onLast bool
+	hash   uint64
+	nonce  uint64
 }
 
 func startServer(port int) (*server, error) {
@@ -52,9 +53,10 @@ func startServer(port int) (*server, error) {
 		lspServer:   lspServer,
 		reqChan:     make(chan *serverReq),
 		pendingReqs: list.New(),
-		clientMap:   make(map[int]clientInfo),
+		clientMap:   make(map[int]*clientInfo),
 		freeMiners:  list.New(),
 		busyMiners:  make(map[int]*reqInfo),
+		msgSize:     10,
 	}
 
 	return newServer, nil
@@ -72,7 +74,7 @@ func dispatchMiner(srv *server, connID int) {
 	if srv.pendingReqs.Front() != nil {
 		// make request
 		elem := srv.pendingReqs.Front()
-		request := elem.Value.(reqInfo)
+		request := elem.Value.(*reqInfo)
 		srv.pendingReqs.Remove(elem)
 		var newReq *bitcoin.Message
 		var minerReq *reqInfo
@@ -84,6 +86,8 @@ func dispatchMiner(srv *server, connID int) {
 				lower:    request.lower,
 				upper:    request.upper,
 			}
+			client := srv.clientMap[minerReq.clientID]
+			client.onLast = true
 
 		} else {
 			newReq = bitcoin.NewRequest(request.data, request.lower, request.lower+srv.msgSize)
@@ -125,6 +129,7 @@ func handleServer(srv *server, closed chan bool) {
 					if isBusy {
 						srv.pendingReqs.PushFront(req)
 						delete(srv.busyMiners, data.connId)
+						//do we need to dispatch miners here?
 					} else {
 						for curr := srv.freeMiners.Front(); curr != nil; curr = curr.Next() {
 							if curr.Value.(int) == data.connId {
@@ -138,6 +143,7 @@ func handleServer(srv *server, closed chan bool) {
 			} else {
 				switch data.msg.Type {
 				case bitcoin.Join:
+					LOGF.Printf("Miner joined, %d", data.connId)
 					dispatchMiner(srv, data.connId)
 				case bitcoin.Result:
 					miner := srv.busyMiners[data.connId]
@@ -145,12 +151,12 @@ func handleServer(srv *server, closed chan bool) {
 					if !ok {
 						continue
 					}
-					client.requestNum--
 					if data.msg.Hash < client.hash {
 						client.hash = data.msg.Hash
 						client.nonce = data.msg.Nonce
 					}
-					if client.requestNum == 0 {
+					if client.onLast {
+						LOGF.Printf("found result for client %d", miner.clientID)
 						go writeResult(client.hash, client.nonce, miner.clientID, srv.lspServer)
 						//remove client since request is done
 						delete(srv.clientMap, miner.clientID)
@@ -159,12 +165,19 @@ func handleServer(srv *server, closed chan bool) {
 					dispatchMiner(srv, data.connId)
 
 				case bitcoin.Request:
+					//NEED TO ADD CLIENT TO MAP!
 					request := &reqInfo{
 						clientID: data.connId,
 						data:     data.msg.Data,
 						lower:    data.msg.Lower,
 						upper:    data.msg.Upper,
 					}
+					newClientReq := &clientInfo{
+						onLast: false,
+						hash:   ^uint64(0),
+						nonce:  0,
+					}
+					srv.clientMap[data.connId] = newClientReq
 					srv.pendingReqs.PushBack(request)
 					for curr := srv.freeMiners.Front(); curr != nil; curr = curr.Next() {
 						if srv.pendingReqs.Len() == 0 {
@@ -221,18 +234,18 @@ func main() {
 
 	go handleServer(srv, closed)
 
-	// TODO: implement this!
 	for {
-
 		id, msg, err := srv.lspServer.Read()
-		var request *bitcoin.Message
-		json.Unmarshal(msg, request)
+		var request bitcoin.Message
+		json.Unmarshal(msg, &request)
+		LOGF.Printf("message: %+v", request)
 		//TODO potentially: What if message is empty?
 		serverRequest := &serverReq{
-			msg:    request,
+			msg:    &request,
 			connId: id,
 			err:    err,
 		}
+		LOGF.Printf("server request: %+v", serverRequest)
 		srv.reqChan <- serverRequest
 
 	}

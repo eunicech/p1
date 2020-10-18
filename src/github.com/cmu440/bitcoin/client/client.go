@@ -43,6 +43,7 @@ func main() {
 	if err != nil {
 		//assume the error means we lost connection with the server
 		printDisconnected()
+		return
 	}
 	var result bitcoin.Message
 	json.Unmarshal(resMsg, &result)

@@ -58,7 +58,7 @@ func main() {
 	for {
 		msg, err := miner.Read()
 		if err != nil {
-			fmt.Printf("Error: %s", err)
+			fmt.Printf("Error: %s\n", err)
 			break
 		}
 		var request bitcoin.Message
