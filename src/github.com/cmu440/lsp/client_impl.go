@@ -13,14 +13,13 @@ import (
 )
 
 type client struct {
-	epochLimit     int
-	windowSize     int
-	maxUnackedMsgs int
-	maxBackOff     int
-	epochSize      int
-	epochMillis    int
-	ticker         *time.Ticker
-	// timer           *time.Time
+	epochLimit      int
+	windowSize      int
+	maxUnackedMsgs  int
+	maxBackOff      int
+	epochSize       int
+	epochMillis     int
+	ticker          *time.Ticker
 	clientID        int
 	conn            *lspnet.UDPConn
 	currSN          int      //keeps track of sequence numbers
@@ -39,26 +38,29 @@ type client struct {
 	signalEpoch     chan bool
 	unreadEpochs    int
 	readInEpoch     bool
-	readChan        chan bool
-	lostCxn         chan bool
+	readChan        chan bool // check if we have read in the epoch
+	lostCxn         chan bool // epochlimit hit without hearing from server
 	willClose       chan bool
 	closeInfoReq    chan bool
 	infoReq         chan bool
 }
 
+// stores messages to be Read()
 type data struct {
 	readReqs    chan readReq
 	pendingData map[int]Message
 	addData     chan Message
-	closed      chan bool
+	closed      chan bool // signals to all goroutines to shut down
 }
 
+// requests made by Read()
 type readReq struct {
 	dataSN  int
 	dataRes chan Message
 	errChan chan error
 }
 
+// type for sliding window of client
 type slidingWindow struct {
 	pendingMsgs    *list.List
 	pendingMsgChan chan []byte
@@ -66,6 +68,7 @@ type slidingWindow struct {
 	numUnAcked     int
 }
 
+// type of element in list of pending messages
 type windowElem struct {
 	sn      int
 	ackChan chan Message
@@ -136,19 +139,22 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		infoReq:         make(chan bool),
 	}
 
-	var epochsPassed int = 0
-	var totalEpochsPassed int = 0
-	var currentBackOff int = 0
-
 	//send connection
 	msg, err := json.Marshal(NewConnect())
 	if err != nil {
 		return nil, err
 	}
+
+	// handle ack from server
 	ackChan := make(chan Message)
 	var ackMsg Message
 	go readConnection(ackChan, udp)
 	udp.Write(msg)
+
+	// use exponential backoff when trying to connect to server
+	var epochsPassed int = 0
+	var totalEpochsPassed int = 0
+	var currentBackOff int = 0
 	var flag bool = false
 	ticker := time.NewTicker(time.Duration(params.EpochMillis * 1000000))
 	for {
@@ -156,10 +162,13 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		case <-ticker.C:
 			epochsPassed++
 			totalEpochsPassed++
+
+			// if exceed epochLimit when attempting to connect, give up
 			if totalEpochsPassed > newClient.epochLimit {
 				flag = true
 				err = errors.New("timed out")
 			}
+
 			if epochsPassed > currentBackOff {
 				udp.Write(msg)
 				epochsPassed = 0
@@ -179,21 +188,26 @@ func NewClient(hostport string, params *Params) (Client, error) {
 			flag = true
 		}
 		if flag {
+			// an ack or error has been received
 			break
 		}
 
 	}
+
 	if err != nil {
 		return nil, err
 	}
+
 	newClient.clientID = ackMsg.ConnID
 	go newClient.clientInfoRequests()
 	go newClient.writeRoutine()
 	go newClient.readRoutine()
 	go newClient.readRequestsRoutine()
+
 	return newClient, nil
 }
 
+// readConnection tries to read an ack from the client when trying to connect
 func readConnection(ackChan chan Message, udp *lspnet.UDPConn) {
 	for {
 		var ackMsg Message
@@ -208,8 +222,9 @@ func readConnection(ackChan chan Message, udp *lspnet.UDPConn) {
 
 }
 
+// clientInfoRequests handles any changes made to the client
+// (e.g. updating sequence number for the client, getting the time, etc)
 func (c *client) clientInfoRequests() {
-	// var flag bool = false
 	for {
 		select {
 		case <-c.getServerSN:
@@ -219,15 +234,11 @@ func (c *client) clientInfoRequests() {
 			c.clientSeqNumRes <- c.currSN
 			c.currSN++
 		case <-c.dataStorage.closed:
-			// flag = true
-			// break
 			return
 		case <-c.closeInfoReq:
-			// flag = true
-			// break
+			// return when finished closing
 			return
 		case <-c.ticker.C:
-			// c.signalEpoch <- true
 			if !c.wroteInEpoch {
 				//send heartbeat
 				ackMsg := NewAck(c.clientID, 0)
@@ -240,8 +251,7 @@ func (c *client) clientInfoRequests() {
 				// increment the number of epochs in which we haven't heard anything
 				c.unreadEpochs++
 				if c.unreadEpochs == c.epochLimit {
-					//c.conn.Close()
-					// TODO: drop the client/ connection
+					// if hit epoch limit, we have lost the client
 					close(c.lostCxn)
 				}
 			} else {
@@ -253,11 +263,7 @@ func (c *client) clientInfoRequests() {
 			c.wroteInEpoch = true
 		case <-c.readChan:
 			c.readInEpoch = true
-			//c.unreadEpochs = 0
 		}
-		// if flag {
-		// 	break
-		// }
 	}
 }
 
@@ -265,36 +271,32 @@ func (c *client) ConnID() int {
 	return c.clientID
 }
 
+// handle requests from Read()
+// pulls data from the data storage and sends it to Read() to be returned
 func (c *client) readRequestsRoutine() {
 	var currReq int
 	var currChan chan Message
 	var errChan chan error
 	var completedReq bool = true
-	// var flag bool = false
 	for {
 		select {
 		case req := <-c.dataStorage.readReqs:
-			//assumes another read request from client can't come until this one is fulfilled
+			// assumes another read request from client can't come until this one is fulfilled
 			currReq = req.dataSN
 			currChan = req.dataRes
 			errChan = req.errChan
 			completedReq = false
 		case packet := <-c.dataStorage.addData:
-			//TODO: only add if it is >= current sn of server
+			// only add packet sequence number >= current sn of server;
+			// otws, we have already read it
 			if packet.SeqNum >= currReq {
 				c.dataStorage.pendingData[packet.SeqNum] = packet
 			}
 		case <-c.dataStorage.closed:
-			// if len(c.dataStorage.pendingData) == 0 {
-			// 	flag = true
-			// }
-			// flag = true
-			// break
 			return
 		case <-c.lostCxn:
 			if !completedReq {
 				errChan <- errors.New("lost cxn")
-				//flag = true
 				close(c.closeInfoReq)
 				return
 			} else {
@@ -302,33 +304,27 @@ func (c *client) readRequestsRoutine() {
 				return
 			}
 		}
-		// if flag {
-		// 	//close(c.closeInfoReq)
-		// 	break
-		// }
+
+		// process current request, if request is in pending data
 		value, exists := c.dataStorage.pendingData[currReq]
 		if exists {
-			//remove the value
+			// remove the value
 			delete(c.dataStorage.pendingData, currReq)
-			//add value to channel
+			// add value to channel
 			currChan <- value
 			completedReq = true
 		}
 	}
 }
 
+// reads all messages from the server and saves them in the data storage
 func (c *client) readRoutine() {
-	//var flag bool = false
 	var dropData bool = false
 	for {
 		select {
 		case <-c.lostCxn:
-			// flag = true
-			// break
 			return
 		case <-c.dataStorage.closed:
-			// flag = true
-			// break
 			return
 		case <-c.willClose:
 			dropData = true
@@ -336,18 +332,22 @@ func (c *client) readRoutine() {
 			//read message from server
 			var packet [2000]byte
 			bytesRead, err := c.conn.Read(packet[0:])
+
+			// if EOF error, have lost the cxn + can't read anymore
 			if err == io.EOF {
 				close(c.lostCxn)
 				break
 			}
+
 			var data Message
 			json.Unmarshal(packet[:bytesRead], &data)
+
+			// indicate that we have read in this epoch
 			select {
 			case c.readChan <- true:
 			default:
 			}
 
-			// c.readChan <- true
 			//check if this an acknowledgement
 			if data.Type == MsgAck {
 				//ignore heartbeats
@@ -355,53 +355,57 @@ func (c *client) readRoutine() {
 					c.acks <- data
 				}
 			} else if !dropData {
-				//data message
+				// dropData = true if Close has been called so we ignore if true
+				// otws process requests
+
+				// truncate data message if needed
 				if data.Size < len(data.Payload) {
 					data.Payload = data.Payload[:data.Size]
 				}
+
+				// check checksum to ensure data integrity
 				chksum := c.checksum(data.ConnID, data.SeqNum, data.Size, data.Payload)
 				if data.Size > len(data.Payload) || chksum != data.Checksum {
 					continue
 				}
 				ack, _ := json.Marshal(NewAck(c.clientID, data.SeqNum))
 				c.conn.Write(ack)
+
+				// indicate that we have written in this epoch
 				select {
 				case c.writtenChan <- true:
 				default:
 				}
+
 				c.dataStorage.addData <- data
 			}
 
 		}
-		// if flag {
-		// 	break
-		// }
 	}
 
 }
 
+// write messages to server and do exponential backoff for msgs being written
 func (c *client) writeMsg(msg Message, ackChan chan Message, ticker *time.Ticker) {
 	byteMsg, _ := json.Marshal(&msg)
 	var currentBackOff int = 0
 	var epochsPassed int = 0
-	//var totalEpochs int = 0
-	// var flag bool = false
 	c.conn.Write(byteMsg)
+
+	// indicate that we have written in this epoch
 	select {
 	case c.writtenChan <- true:
 	default:
 	}
+
 	for {
 		select {
 		case <-c.lostCxn:
-			// flag = true
-			// break
 			return
 		case <-ackChan:
-			// flag = true
-			// break
 			return
 		case <-ticker.C:
+			// handle exponential backoff rules
 			if epochsPassed == currentBackOff {
 				c.conn.Write(byteMsg)
 				select {
@@ -424,34 +428,29 @@ func (c *client) writeMsg(msg Message, ackChan chan Message, ticker *time.Ticker
 				epochsPassed++
 			}
 		}
-		// if flag {
-		// 	break
-		// }
 	}
 }
 
+// store pending messages that need to be written, since Write() should not block
 func (c *client) writeRoutine() {
 	var needToClose bool = false
-	//var flag bool = false
 	for {
 		select {
 		case <-c.lostCxn:
-			//close(c.dataStorage.closed)
-			//flag = true
 			return
-
 		case <-c.closeActivate:
+			// Close() has been called, but still need to finish writing pending msgs
 			if !needToClose {
 				c.willClose <- true
 				needToClose = true
 			}
 			if c.window.pendingMsgs.Len() == 0 {
 				close(c.dataStorage.closed)
-				//flag = true
 				return
 			}
 
 		case payload := <-c.window.pendingMsgChan:
+			// handles pending messages that come in from writeroutine
 			c.getClientSN <- true
 			sn := <-c.clientSeqNumRes
 			chkSum := c.checksum(c.clientID, sn, len(payload), payload)
@@ -465,6 +464,8 @@ func (c *client) writeRoutine() {
 			}
 
 			c.window.pendingMsgs.PushBack(newElem)
+
+			// write messages to server if within sliding window
 			if c.window.pendingMsgs.Len() == 1 {
 				c.window.start = newElem.sn
 				newTicker := time.NewTicker(time.Duration(c.epochMillis * 1000000))
@@ -479,7 +480,7 @@ func (c *client) writeRoutine() {
 			}
 
 		case ack := <-c.acks:
-			//put ack in corresponding channel
+			// put ack in corresponding channel
 			sn := ack.SeqNum
 			for elem := c.window.pendingMsgs.Front(); elem != nil; elem = elem.Next() {
 				currElem := elem.Value.(*windowElem)
@@ -489,7 +490,7 @@ func (c *client) writeRoutine() {
 				}
 			}
 
-			//remove messages that are acknowledged
+			// remove messages that are acknowledged
 			var count int = 0
 			var startFlag bool = true
 			var removedFromStart int = 0
@@ -512,12 +513,14 @@ func (c *client) writeRoutine() {
 				count++
 				currElem = nextElem
 			}
-			//update start of window
+
+			// update start of window
 			if c.window.pendingMsgs.Front() != nil {
 				c.window.start = c.window.pendingMsgs.Front().Value.(*windowElem).sn
 			}
 
-			//update window
+			// update window
+			// write any new msgs now in sliding window bc ack has been received
 			count = 0
 			var numStarted int = 0
 			currElem = c.window.pendingMsgs.Front()
@@ -538,22 +541,19 @@ func (c *client) writeRoutine() {
 				}
 				count++
 			}
+
+			// if need to close and finished writing all pending msgs, return
 			if needToClose && c.window.pendingMsgs.Len() == 0 {
-				// flag = true
 				close(c.dataStorage.closed)
-				//break
 				return
 			}
+
 			c.window.numUnAcked += numStarted
 		}
-
-		// if flag {
-		// 	break
-		// }
-
 	}
 }
 
+// checksum implements a checksum to verify data integrity
 func (c *client) checksum(connID int, seqNum int, size int, payload []byte) uint16 {
 	var sum uint32 = 0
 	MaxUint := ^uint32(0)
@@ -584,7 +584,7 @@ func (c *client) checksum(connID int, seqNum int, size int, payload []byte) uint
 }
 
 func (c *client) Read() ([]byte, error) {
-	//get number of data packet you need to read
+	// get number of data packet you need to read
 	if c.closed {
 		return nil, errors.New("already closed")
 	}
@@ -592,7 +592,7 @@ func (c *client) Read() ([]byte, error) {
 	sn := <-c.serverSeqNumRes
 	err := make(chan error)
 	result := make(chan Message)
-	//create read request
+	// create read request
 	request := readReq{
 		dataSN:  sn,
 		dataRes: result,
@@ -613,14 +613,14 @@ func (c *client) Write(payload []byte) error {
 }
 
 func (c *client) Close() error {
-
-	//check if client was already closed
+	// check if client was already closed
 	if c.closed {
 		return errors.New("Client already closed")
 	}
 	c.closed = true
 
 	close(c.closeActivate)
+
 	select {
 	case <-c.dataStorage.closed:
 		c.conn.Close()
@@ -629,5 +629,4 @@ func (c *client) Close() error {
 		c.conn.Close()
 		return nil
 	}
-	//<-c.dataStorage.closed
 }
