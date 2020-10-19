@@ -32,6 +32,8 @@ func main() {
 
 	defer client.Close()
 
+	// send job request to calculate min hash and corresponding nonce
+	// up to and including maxNonce
 	req := bitcoin.NewRequest(message, 0, maxNonce)
 	msg, err := json.Marshal(req)
 	if err != nil {
@@ -39,15 +41,18 @@ func main() {
 		return
 	}
 	client.Write(msg)
+
+	// read result of job request
 	resMsg, err := client.Read()
 	if err != nil {
-		//assume the error means we lost connection with the server
+		// assume the error means we lost connection with the server
 		printDisconnected()
 		return
 	}
 	var result bitcoin.Message
 	json.Unmarshal(resMsg, &result)
 
+	// print result only happens if client didn't disconnect in the middle
 	printResult(result.Hash, result.Nonce)
 }
 
