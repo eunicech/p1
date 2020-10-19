@@ -16,6 +16,7 @@ func joinWithServer(hostport string) (lsp.Client, error) {
 	if err != nil {
 		return nil, errors.New("Failed to connect to server")
 	}
+	// send join message to server to indicate this is a miner
 	joinMsg := bitcoin.NewJoin()
 	msg, err := json.Marshal(joinMsg)
 	if err != nil {
@@ -25,10 +26,9 @@ func joinWithServer(hostport string) (lsp.Client, error) {
 	return client, nil
 }
 
-// getNonce computes the hash of nonce concatenated with string
+// getNonce computes the hash string concatenated with nonce
 // for each nonce in range [lower, upper] (inclusive)
-// it then returns the minimum hash value and the nonce corresponding
-// to that minimum hash
+// returns the minimum hash value and corresponding nonce
 func getNonce(data string, lower uint64, upper uint64) (uint64, uint64) {
 	var maxNonce, hash uint64 = 0, ^uint64(0)
 	for i := lower; i <= upper; i++ {
@@ -57,16 +57,18 @@ func main() {
 
 	defer miner.Close()
 	for {
-		// read requests from the server and stop reading if there is an error
+		// read requests from the server
 		msg, err := miner.Read()
 		if err != nil {
+			// assume error means we disconnected from the server
+			// miner can stop working
 			fmt.Printf("Error: %s\n", err)
 			break
 		}
 		var request bitcoin.Message
 		json.Unmarshal(msg, &request)
 
-		// compute the minimum hash and return the corresponding nonce
+		// compute the minimum hash and corresponding nonce
 		hash, nonce := getNonce(request.Data, request.Lower, request.Upper)
 
 		// send result back to server

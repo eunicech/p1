@@ -15,10 +15,10 @@ import (
 type server struct {
 	lspServer   lsp.Server
 	pendingReqs *list.List          // requests that still need to be sent to miners
-	clientMap   map[int]*clientInfo // keep track of active clients and status of their requests
-	reqChan     chan *serverReq     // handle any requests to the server
+	clientMap   map[int]*clientInfo // active clients and status of their requests
+	reqChan     chan *serverReq     // channel for requests to main routine
 	freeMiners  *list.List          // queue keeping track of miners that are free receive requests
-	busyMiners  map[int]*reqInfo    // keeps track of miners currently working through requests
+	busyMiners  map[int]*reqInfo    // miners currently working through requests
 	msgSize     uint64
 }
 
@@ -61,17 +61,24 @@ func startServer(port int) (*server, error) {
 
 var LOGF *log.Logger
 
-// writes the given data to the server
+// writes the result of a request back to client
 func writeResult(hash uint64, nonce uint64, clientID int, srv lsp.Server) {
 	msg := bitcoin.NewResult(hash, nonce)
 	msgBytes, _ := json.Marshal(msg)
 	srv.Write(clientID, msgBytes)
 }
 
-// will check if there are any free miners and pending requests;
+// checks if there are any free miners and pending requests;
 // if there are, it will send as many requests as possible with
 // the given miners
-// also handles the load balancing algorithm
+// ** Load Balancing Algorithm **
+// Load balancing occurs by taking a request off the queue. If the request is bigger than the
+// predetermined maximum size for a request to a miner, only part of the request is sent. The
+// remainder of the request is appended to the back of the queue. This ensures efficiency as similarly
+// sized requests will take the same average time. Smaller requests will finish quicker (due to requiring
+// less removals from the queue to finish the request) therefore this also ensures fairness
+// Each miner on the free miners list will get work of about the same size (unless the requests are small)
+// if there are sufficient requests to work on. This ensures the work is divided evenly between miners.
 func dispatchMiner(srv *server) {
 	var elem = srv.pendingReqs.Front()
 	var miner = srv.freeMiners.Front()
@@ -86,9 +93,8 @@ func dispatchMiner(srv *server) {
 		var newReq *bitcoin.Message
 		var minerReq *reqInfo
 
-		// if the size of the range between upper and lower is smaller than the
-		// predetermined chunk size, send the entire request and remove it from the
-		// queue
+		// if remaining range is smaller than the predetermined chunk size,
+		// send the entire request and remove request from the queue
 		if request.upper-request.lower+1 <= srv.msgSize {
 			newReq = bitcoin.NewRequest(request.data, request.lower, request.upper)
 			minerReq = &reqInfo{
@@ -98,9 +104,11 @@ func dispatchMiner(srv *server) {
 				upper:    request.upper,
 			}
 		} else {
-			// if the size of the range between upper nad lower is bigger
-			// than predetermined chunk size, send part of the request
-			// and put the rest of the request at the end of the queue, to be sent later
+			// size of request is bigger than predetermined chunk size
+			// send part of request, put remainder of request at the back of the queue
+			// ** Load Balanacing: remainder of request is added to the back
+			// of the queue, smaller requests will be completed first since
+			// they require fewer removals from the queue to finish the request **
 			newReq = bitcoin.NewRequest(request.data, request.lower, request.lower+srv.msgSize-1)
 			minerReq = &reqInfo{
 				clientID: request.clientID,
@@ -133,23 +141,24 @@ func handleServer(srv *server, closed chan bool) {
 		case data := <-srv.reqChan:
 			if data.err != nil {
 				// CASE: DISCONNECTED CLIENT OR MINER
-				// if it is  disconnected client, delete it from clientmap
-				// (all results from miners pertaining to this client will be ignored)
+
 				_, isClient := srv.clientMap[data.connID]
 				if isClient {
+					// Disconnected client: delete it from clientmap
+					// (all results from miners pertaining to this client will be ignored)
 					delete(srv.clientMap, data.connID)
 				} else {
-					// check if disconnected is a busy miner
 					req, isBusy := srv.busyMiners[data.connID]
 					if isBusy {
-						// if busy miner returns an error, put the request they were working
-						// through back on the queue to be handled by another free miner, and
+						// Disconnected busy miner: retrieve the request they were working on
+						// and add to front of queue
 						// delete the miner from list of busy miners
 						srv.pendingReqs.PushFront(req)
 						delete(srv.busyMiners, data.connID)
+						// Check if there are any free miners to work on the request of the disconnected miner
 						dispatchMiner(srv)
 					} else {
-						// if receive error from free miner, delete it from queue of free miners
+						// Disconnected free miner: delete the miner from the queue
 						for curr := srv.freeMiners.Front(); curr != nil; curr = curr.Next() {
 							if curr.Value.(int) == data.connID {
 								srv.freeMiners.Remove(curr)
@@ -163,11 +172,14 @@ func handleServer(srv *server, closed chan bool) {
 			} else {
 				switch data.msg.Type {
 				case bitcoin.Join:
-					// with a new miner, add it to the free miners queue
+					// Case: New miner
+					// add to free miners queue
 					srv.freeMiners.PushFront(data.connID)
-					// use the free miners to handle pending requests
+					// check if there are any pending messages the free miner can work on
+					// ** Load Balancing: idle time of miner is minimized **
 					dispatchMiner(srv)
 				case bitcoin.Result:
+					// Case: Result from miner
 					miner, ok := srv.busyMiners[data.connID]
 					if !ok {
 						// should never reach this case, since only busy miners should return results
@@ -175,7 +187,7 @@ func handleServer(srv *server, closed chan bool) {
 					}
 					client, ok := srv.clientMap[miner.clientID]
 
-					// if clientID not in map, client was lost, so we just ignore it
+					// if clientID not in map, client was lost: ignore resule
 					if ok {
 						// otherwise, this is a valid client, so update the min hash and nonce accordingly
 						if data.msg.Hash < client.hash {
@@ -193,32 +205,40 @@ func handleServer(srv *server, closed chan bool) {
 						}
 					}
 
-					// if we receive a result, it always increases the number of free miners, and is no longer busy
+					// Received a result: busy miner is now free
+					// ** Load Balancing: Free miner added to end of list, ensures all miners
+					// that weren't working previously will first get work before this miner. Allows
+					// for utilization of all miners **
 					srv.freeMiners.PushBack(data.connID)
 					delete(srv.busyMiners, data.connID)
 
-					// with more free miners, check if we can send any pending requests
+					// check if there are pending requests for the free miner to work on
+					// ** Load Balancing: idle time of miner is minimized **
 					dispatchMiner(srv)
 
 				case bitcoin.Request:
-					// request from a client
+					// Case: Request from a client
+
+					// create new client to keep track of best hash values
+					// add to client map
+					newClientReq := &clientInfo{
+						numReqs: int((data.msg.Upper + srv.msgSize) / srv.msgSize),
+						hash:    ^uint64(0),
+						nonce:   0,
+					}
+					srv.clientMap[data.connID] = newClientReq
+
+					// add client request to pending requests
 					request := &reqInfo{
 						clientID: data.connID,
 						data:     data.msg.Data,
 						lower:    data.msg.Lower,
 						upper:    data.msg.Upper,
 					}
-					newClientReq := &clientInfo{
-						numReqs: int((data.msg.Upper + srv.msgSize) / srv.msgSize),
-						hash:    ^uint64(0),
-						nonce:   0,
-					}
-
-					// add client request to pending requests
-					srv.clientMap[data.connID] = newClientReq
 					srv.pendingReqs.PushFront(request)
 
-					// try to use free miners to handle newly added requests
+					// check if there are free miners to start working on request
+					// ** Load Balancing: idle time of miner is minimized **
 					dispatchMiner(srv)
 				}
 			}
@@ -271,7 +291,7 @@ func main() {
 		var request bitcoin.Message
 		json.Unmarshal(msg, &request)
 
-		// send messages to main server method to handle
+		// send to main server method to handle messages from clients/miners
 		serverRequest := &serverReq{
 			msg:    &request,
 			connID: id,
